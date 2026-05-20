@@ -145,6 +145,8 @@ int g_case1_coord_w_sign = 0;
 bool g_case2_post_maze_placeholder = false;
 
 std::atomic<int> g_last_aruco_id(-1);
+/** 为 true 时显示 OpenCV 窗口；默认 false，便于无 DISPLAY 的机载环境 */
+static bool g_enable_gui = false;
 
 // =============================================================================
 // 辅助线程：ArUco ID 经 TCP 写入 g_last_aruco_id
@@ -809,16 +811,19 @@ static int runMainLoop(AppRuntime &rt)
         // ---------- 状态日志（每帧；可后续改为降频或宏开关）----------
         cout << " Flag_Task: " << Flag_Task << "|ob_x: " << ob_x << "|ob_y: " << ob_y << "|ob_z: " << ob_z << "|px: " << px << "|py: " << py << "|yaw: " << yaw << endl;
 
-        /* FPS overlay */
-        double fps = fcount / chrono::duration<double>(chrono::steady_clock::now() - t0).count();
-        putText(undist, format("FPS %.1f", fps), {10, 30},
-                FONT_HERSHEY_SIMPLEX, 1, {0, 255, 0}, 2);
+        if (g_enable_gui)
+        {
+            double fps = fcount / chrono::duration<double>(chrono::steady_clock::now() - t0).count();
+            putText(undist, format("FPS %.1f", fps), {10, 30},
+                    FONT_HERSHEY_SIMPLEX, 1, {0, 255, 0}, 2);
+        }
 
         // ---------- FSM 公共量：相对起点的局部坐标 ----------
         double lx, ly, dyaw;
         transformLocal(px, py, yaw, lx, ly, dyaw);
         (void)ly;
         (void)dyaw;
+        //Flag_Task = -1;
         switch (Flag_Task)
         {
         // ----- case0：起点前跳 + 巡线 → 雷达判定进入窄过道（case1）-----
@@ -1099,16 +1104,18 @@ static int runMainLoop(AppRuntime &rt)
             return 0;
         }
 
-        // ---------- OpenCV：雷达原始曲线 + 前视画面（不参与控制）----------
-        static std::deque<float> range_hist_x, range_hist_y, range_hist_z;
-        pushRangeSampleRaw(range_hist_x, ob_x);
-        pushRangeSampleRaw(range_hist_y, ob_y);
-        pushRangeSampleRaw(range_hist_z, ob_z);
-        imshow("Range ob_x | ob_y+ob_z (raw)", makeRangePlotMat(range_hist_x, range_hist_y, range_hist_z));
-
-        imshow("Go2 Front Cam", undist);
-        if (waitKey(1) == 27)
-            break; // ESC to quit
+        if (g_enable_gui)
+        {
+            static std::deque<float> range_hist_x, range_hist_y, range_hist_z;
+            pushRangeSampleRaw(range_hist_x, ob_x);
+            pushRangeSampleRaw(range_hist_y, ob_y);
+            pushRangeSampleRaw(range_hist_z, ob_z);
+            imshow("Range ob_x | ob_y+ob_z (raw)",
+                   makeRangePlotMat(range_hist_x, range_hist_y, range_hist_z));
+            imshow("Go2 Front Cam", undist);
+            if (waitKey(1) == 27)
+                break; // ESC to quit
+        }
     }
     sc.StopMove();
     return 0;
@@ -1118,14 +1125,27 @@ int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        cerr << "Usage: " << argv[0] << " <ethernet_if>\n";
+        cerr << "Usage: " << argv[0] << " <ethernet_if> [--gui]\n"
+             << "  --gui   显示雷达曲线与前视窗口（需桌面或 X11）；默认关闭以便无 DISPLAY 运行\n";
         return -1;
     }
 
+    const char *eth_if = argv[1];
+    for (int i = 2; i < argc; ++i)
+    {
+        if (std::string(argv[i]) == "--gui")
+            g_enable_gui = true;
+        else
+        {
+            cerr << "Unknown option: " << argv[i] << "\n";
+            return -1;
+        }
+    }
+
     // SportClient 构造即会建立 DDS 请求通道，必须先初始化 ChannelFactory（见 AppRuntime 成员顺序）。
-    ChannelFactory::Instance()->Init(0, argv[1]);
+    ChannelFactory::Instance()->Init(0, eth_if);
     AppRuntime rt;
-    if (!initAppRuntime(rt, argv[1]))
+    if (!initAppRuntime(rt, eth_if))
     {
         cerr << "Front camera stream not opened\n";
         return -1;
@@ -1133,6 +1153,11 @@ int main(int argc, char **argv)
 
     std::thread aruco_thread(aruco_socket_server, 5005);
     aruco_thread.detach();
+
+    if (g_enable_gui)
+        cout << "GUI enabled (ESC in video window to quit)\n";
+    else
+        cout << "GUI disabled (headless); use Ctrl+C to stop\n";
 
     return runMainLoop(rt);
 }
