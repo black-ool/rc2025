@@ -47,8 +47,12 @@ static const Mat D = (Mat_<double>(1, 4) << -0.4157, 0.1327, 0, 0);
 static constexpr float kRangeEmaAlpha = 0.35f;
 
 // --- case0 → case1：窄过道入门（约 0.6 m 宽 → 居中时左右约 0.3 m）---
+/** 进入 case0 后沿局部前向 lx 前进该距离 (m) 再执行 FrontJump */
+static constexpr double kCase0PreJumpForward_m = 0.2;
 /** 起跳后沿局部前向 lx 至少前进该距离后才允许雷达触发进入 case1，防止落点误触发 */
 static constexpr double kCase0PostJumpMinForward_m = 0.45;
+/** 起跳后等待落地再巡线的帧数（替代阻塞 sleep，约 30fps 下 1.5s） */
+static constexpr int kCase0PostJumpSettleFrames = 45;
 /** 单侧距离落在该区间 (m) 视为贴近过道一侧墙（居中） */
 static constexpr float kEnterMazeSideLo_m = 0.18f;
 static constexpr float kEnterMazeSideHi_m = 0.48f;
@@ -823,34 +827,62 @@ static int runMainLoop(AppRuntime &rt)
         transformLocal(px, py, yaw, lx, ly, dyaw);
         (void)ly;
         (void)dyaw;
-        //Flag_Task = -1;
         switch (Flag_Task)
         {
-        // ----- case0：起点前跳 + 巡线 → 雷达判定进入窄过道（case1）-----
-        case 0: /* 起点区 —— jump once, then line following until case1 */
+        // ----- case0：前进 0.2m → 起跳 → 巡线 → 雷达判定进入窄过道（case1）-----
+        case 0:
         {
-            // Walk forward briefly, then jump once to cross the starting line
-            if (start_jump_times == 0)
+            /** 0 前进至 kCase0PreJumpForward_m；1 起跳后落地等待；2 巡线 */
+            static int case0_phase = 0;
+            static double lx_anchor_case0 = 0;
+            static bool lx_anchor_case0_set = false;
+            static int case0_jump_settle_frm = 0;
+            static double lx_anchor_post_jump = 0;
+            static bool lx_anchor_post_jump_set = false;
+
+            if (!lx_anchor_case0_set)
+            {
+                lx_anchor_case0 = lx;
+                lx_anchor_case0_set = true;
+            }
+            const double forward_in_case0 = lx - lx_anchor_case0;
+
+            if (case0_phase == 0)
             {
                 sc.StaticWalk();
+                if (forward_in_case0 >= kCase0PreJumpForward_m)
+                {
+                    sc.StopMove();
+                    sc.FrontJump();
+                    case0_phase = 1;
+                    case0_jump_settle_frm = kCase0PostJumpSettleFrames;
+                    start_jump_times = 1;
+                    cout << "[case0] 已前进 " << forward_in_case0 << " m → 起跳" << endl;
+                }
+                else
                 {
                     float vx0 = 0.3f, vy0 = 0.f;
                     applyRangeClearance(ob_x, ob_y, ob_z, vx0, vy0);
-                    sc.Move(vx0, vy0, 0);
+                    sc.Move(vx0, vy0, 0.f);
                 }
-                this_thread::sleep_for(chrono::milliseconds(2500));
-                sc.StopMove();
-                sc.FrontJump();
-                start_jump_times++;
-                cout << "跳跃完成" << endl;
-                // Wait for the jump to complete before resuming walk
-                this_thread::sleep_for(chrono::milliseconds(1500));
-                break; // Skip line-following this iteration
+                break;
             }
 
-            /* 起跳后沿 lx 累计前进距离，与雷达联判进入迷宫 */
-            static double lx_anchor_post_jump = 0;
-            static bool lx_anchor_post_jump_set = false;
+            if (case0_phase == 1)
+            {
+                sc.StaticWalk();
+                sc.Move(0.f, 0.f, 0.f);
+                if (--case0_jump_settle_frm <= 0)
+                {
+                    case0_phase = 2;
+                    lx_anchor_post_jump = lx;
+                    lx_anchor_post_jump_set = true;
+                    cout << "[case0] 跳跃完成，开始巡线" << endl;
+                }
+                break;
+            }
+
+            /* case0_phase == 2：巡线 */
             if (!lx_anchor_post_jump_set)
             {
                 lx_anchor_post_jump = lx;
@@ -858,14 +890,11 @@ static int runMainLoop(AppRuntime &rt)
             }
             const double forward_since_jump = lx - lx_anchor_post_jump;
 
-            /* 巡线 */
-            /* Basic binary mask & centre-line deviation */
             Mat gray, blur, bin;
             cvtColor(undist, gray, COLOR_BGR2GRAY);
             GaussianBlur(gray, blur, {15, 15}, 0);
             threshold(blur, bin, 50, 255, THRESH_BINARY_INV);
 
-            // compute mean X of white pixels on bottom rows
             double err = 0;
             int cnt = 0;
             for (int r = blur.rows - 1; r >= blur.rows - 120; --r)
@@ -880,9 +909,8 @@ static int runMainLoop(AppRuntime &rt)
             }
             err = cnt ? err / cnt : 0;
 
-            double steer = -0.001 * err; // pixel→rad gain
+            double steer = -0.001 * err;
 
-            // Enter static walk mode
             sc.StaticWalk();
             sc.Euler(0, 0.25, 0);
 
