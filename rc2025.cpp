@@ -51,8 +51,8 @@ static constexpr float kRangeEmaAlpha = 0.35f;
 static constexpr double kCase0PreJumpForward_m = 0.2;
 /** 起跳后沿局部前向 lx 至少前进该距离后才允许雷达触发进入 case1，防止落点误触发 */
 static constexpr double kCase0PostJumpMinForward_m = 0.45;
-/** 起跳后等待落地再巡线的帧数（替代阻塞 sleep，约 30fps 下 1.5s） */
-static constexpr int kCase0PostJumpSettleFrames = 45;
+/** 起跳后等待落地再巡线的帧数（非阻塞；约 30fps 下 0.4s） */
+static constexpr int kCase0PostJumpSettleFrames = 12;
 /** 单侧距离落在该区间 (m) 视为贴近过道一侧墙（居中） */
 static constexpr float kEnterMazeSideLo_m = 0.18f;
 static constexpr float kEnterMazeSideHi_m = 0.48f;
