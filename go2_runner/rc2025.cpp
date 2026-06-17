@@ -868,6 +868,7 @@ static int runMainLoop(AppRuntime &rt)
         transformLocal(px, py, yaw, lx, ly, dyaw);
         (void)ly;
         (void)dyaw;
+        //Flag_Task = 1
         switch (Flag_Task)
         {
         // ----- case0：前进 0.1m → 起跳 → 站直后稳定等待 → 巡线 → case1 -----

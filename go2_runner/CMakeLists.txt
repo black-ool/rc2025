@@ -41,7 +41,20 @@ link_directories(
 )
 
 # ─────────── Our executable ──────────────
-add_executable(rc2025_run rc2025.cpp)
+add_executable(rc2025_run
+    main.cpp
+    globals.cpp
+    callbacks.cpp
+    utils.cpp
+    visualizer.cpp
+    aruco_server.cpp
+    app_runtime.cpp
+    cases/case0.cpp
+    cases/case1.cpp
+    cases/case2.cpp
+    cases/case3.cpp
+    cases/case4.cpp
+)
 
 # Ensure we load the SAME DDS libraries at run-time that we linked against.
 # Use RPATH (not RUNPATH) so it takes precedence over LD_LIBRARY_PATH.
