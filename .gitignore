@@ -1,5 +1,6 @@
 # 用户指定忽略
 .cursor/
+.vscode/
 rc2025 copy.cpp
 
 # CMake / 本地构建产物（建议）
