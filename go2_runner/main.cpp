@@ -1,4 +1,5 @@
 #include <unitree/robot/go2/sport/sport_client.hpp>
+#include <unitree/robot/go2/obstacles_avoid/obstacles_avoid_client.hpp>
 #include <unitree/robot/channel/channel_factory.hpp>
 #include <unitree/common/time/time_tool.hpp>
 
@@ -7,7 +8,8 @@
 #include <chrono>
 #include <iostream>
 #include <thread>
-#include <deque>
+#include <csignal>
+#include <atomic>
 
 #include "params.h"
 #include "globals.h"
@@ -26,18 +28,33 @@ using namespace cv;
 using namespace std;
 
 // =============================================================================
+// Ctrl+C 安全退出
+// =============================================================================
+static atomic<bool> g_exit_requested(false);
+
+void signalHandler(int sig)
+{
+    if (sig == SIGINT)
+    {
+        cout << "\n[SIGINT] Ctrl+C caught, will exit after cleanup..." << endl;
+        g_exit_requested = true;
+    }
+}
+
+// =============================================================================
 // 主循环
 // =============================================================================
 static int runMainLoop(AppRuntime &rt)
 {
     go2::SportClient &sc = rt.sc;
+    go2::ObstaclesAvoidClient &avoid_client = rt.avoid_client;
     VideoCapture &cap = rt.cap;
 
     Mat frame, undist;
     int fcount = 0;
     auto t0 = chrono::steady_clock::now();
 
-    while (true)
+    while (!g_exit_requested)
     {
         // ---------- 图像采集与去畸变 ----------
         if (!cap.read(frame) || frame.empty())
@@ -45,62 +62,132 @@ static int runMainLoop(AppRuntime &rt)
         fcount++;
         undistort(frame, undist, K, D);
 
-        // ---------- 状态日志 ----------
-        cout << " Flag_Task: " << Flag_Task
-             << "|ob_x: " << ob_x << "|ob_y: " << ob_y << "|ob_z: " << ob_z
-             << "|px: " << px << "|py: " << py << "|yaw: " << yaw << endl;
-
-        if (g_enable_gui)
+        // ---------- 状态日志 (每30帧) ----------
+        if (fcount % 30 == 0)
         {
-            double fps = fcount / chrono::duration<double>(chrono::steady_clock::now() - t0).count();
-            putText(undist, format("FPS %.1f", fps), {10, 30},
-                    FONT_HERSHEY_SIMPLEX, 1, {0, 255, 0}, 2);
+            double lx, ly, dyaw;
+            transformLocal(px, py, yaw, lx, ly, dyaw);
+            cout << "[Status] Flag=" << Flag_Task << " lx=" << lx << " ly=" << ly
+                 << " yaw=" << dyaw << " px=" << px << " py=" << py << endl;
         }
+
+        // ---------- FPS 叠加 ----------
+        double fps = fcount / chrono::duration<double>(chrono::steady_clock::now() - t0).count();
+        putText(undist, format("FPS %.1f", fps), {10, 30},
+                FONT_HERSHEY_SIMPLEX, 1, {0, 255, 0}, 2);
 
         // ---------- 相对起点坐标 ----------
         double lx, ly, dyaw;
         transformLocal(px, py, yaw, lx, ly, dyaw);
-        (void)ly;
-        (void)dyaw;
 
-        // ---------- 状态机调度 ----------
+        // ---------- Debug 显示 ----------
+        static Mat display_img = undist.clone();
+
+        // ===================== 主状态机 FSM =====================
         switch (Flag_Task)
         {
+        // ---- case 0: 巡线 ----
         case 0:
-            if (case0_tick(sc, undist, rt.stateCB.state, lx))
+        {
+            bool to_case1 = case0_tick(sc, undist, rt.stateCB.state, fcount);
+            display_img = undist.clone();
+            if (to_case1)
+            {
                 Flag_Task = 1;
+                case1_reset_statics();  // reset phase etc
+            }
             break;
+        }
+
+        // ---- case 1: S型走廊避障 ----
         case 1:
-            if (case1_tick(sc))
-                Flag_Task = 2;
+        {
+            bool back_to_0 = case1_tick(sc, fcount, lx, ly, yaw);
+            display_img = undist.clone();
+            if (back_to_0)
+            {
+                Flag_Task = 0;
+                case0_reset_statics();
+            }
             break;
+        }
+
+        // ---- case 2: ArUco 检测 + 左转90° ----
         case 2:
-            case2_tick(sc, undist);
+        {
+            bool to_case3 = case2_tick(sc);
+            if (to_case3)
+            {
+                Flag_Task = 3;
+            }
             break;
+        }
+
+        // ---- case 3: 前进找下一个 ArUco → Flag_Task=4~8 ----
         case 3:
-            case3_tick(sc);
+        {
+            bool to_case9 = case3_tick(sc, lx, ly, dyaw);
+            if (to_case9)
+            {
+                Flag_Task = 9;
+            }
             break;
+        }
+
+        // ---- case 4~8 合并在 case3 内部子状态处理 ----
         case 4:
-            if (case4_tick(sc))
+        case 5:
+        case 6:
+        case 7:
+        case 8:
+        {
+            // 这些 case 在旧代码中是独立的 while(true) 阻塞式，但这里统一走 case3
+            // 如果外部仍有 Flag_Task 设为这些值，也走 case3
+            bool to_case9 = case3_tick(sc, lx, ly, dyaw);
+            if (to_case9)
+            {
+                Flag_Task = 9;
+            }
+            break;
+        }
+
+        // ---- case 9: 完成 + 恢复遥控 ----
+        case 9:
+        {
+            if (case4_tick(sc, avoid_client))
+            {
+                cout << "[Exit] Mission complete, exiting main loop." << endl;
                 return 0;
+            }
+            break;
+        }
+
+        default:
             break;
         }
 
         // ---------- GUI ----------
         if (g_enable_gui)
         {
-            static std::deque<float> range_hist_x, range_hist_y, range_hist_z;
-            pushRangeSampleRaw(range_hist_x, ob_x);
-            pushRangeSampleRaw(range_hist_y, ob_y);
-            pushRangeSampleRaw(range_hist_z, ob_z);
-            imshow("Range ob_x | ob_y+ob_z (raw)",
-                   makeRangePlotMat(range_hist_x, range_hist_y, range_hist_z));
-            imshow("Go2 Front Cam", undist);
-            if (waitKey(1) == 27)
+            imshow("Go2 Front Cam - Visual Nav", display_img);
+            if (waitKey(1) == 27 || g_exit_requested)
                 break;
         }
     }
+
+    // 退出清理
+    cout << "[Exit] Cleaning up and restoring remote control..." << endl;
     sc.StopMove();
+    avoid_client.UseRemoteCommandFromApi(false);
+    avoid_client.SwitchSet(false);
+    avoid_client.Move(0, 0, 0);
+    this_thread::sleep_for(chrono::milliseconds(200));
+    sc.SwitchJoystick(true);
+    sc.RecoveryStand();
+    this_thread::sleep_for(chrono::milliseconds(500));
+    sc.BalanceStand();
+    cout << "[Exit] Remote control restored. Goodbye." << endl;
+
     return 0;
 }
 
@@ -112,14 +199,14 @@ int main(int argc, char **argv)
     if (argc < 2)
     {
         cerr << "Usage: " << argv[0] << " <ethernet_if> [--gui]\n"
-             << "  --gui   显示雷达曲线与前视窗口（需桌面或 X11）；默认关闭以便无 DISPLAY 运行\n";
+             << "  --gui   显示前视窗口（需桌面或 X11）；默认关闭以便无 DISPLAY 运行\n";
         return -1;
     }
 
     const char *eth_if = argv[1];
     for (int i = 2; i < argc; ++i)
     {
-        if (std::string(argv[i]) == "--gui")
+        if (string(argv[i]) == "--gui")
             g_enable_gui = true;
         else
         {
@@ -128,7 +215,12 @@ int main(int argc, char **argv)
         }
     }
 
+    // 注册 SIGINT 信号处理器
+    signal(SIGINT, signalHandler);
+
+    /* Init Unitree DDS */
     ChannelFactory::Instance()->Init(0, eth_if);
+
     AppRuntime rt;
     if (!initAppRuntime(rt, eth_if))
     {
@@ -136,7 +228,13 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    std::thread aruco_thread(aruco_socket_server, 5005);
+    // 保存初始位姿 (跳跃前)
+    px0 = px;
+    py0 = py;
+    yaw0 = yaw;
+
+    // 启动 ArUco socket 服务线程
+    thread aruco_thread(aruco_socket_server, 5005);
     aruco_thread.detach();
 
     if (g_enable_gui)

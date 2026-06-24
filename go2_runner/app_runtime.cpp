@@ -13,16 +13,24 @@ bool initAppRuntime(AppRuntime &rt, const char *eth_if)
 {
     rt.sc.SetTimeout(10.0f);
     rt.sc.Init();
+    rt.sc.BalanceStand();
+
+    /* Obstacles avoid client - enable remote command mode, disable built-in avoidance */
+    rt.avoid_client.Init();
+    rt.avoid_client.UseRemoteCommandFromApi(true);
+    rt.avoid_client.SwitchSet(false);
+
     rt.sub_range.InitChannel(rangeCB);
     rt.sub_state.InitChannel(rt.stateCB);
-    rt.sc.BalanceStand();
+
     px0 = px;
     py0 = py;
     yaw0 = yaw;
+
     const std::string gst_front =
         std::string("udpsrc address=230.1.1.1 port=1720 multicast-iface=") + eth_if +
         " ! application/x-rtp, media=video, encoding-name=H264 "
-        "! rtph264depay ! h264parse ! avdec_h264 ! videoconvert "
+        "! rtph264depay ! avdec_h264 ! videoconvert "
         "! video/x-raw,width=1280,height=720,format=BGR ! appsink drop=1";
     return rt.cap.open(gst_front, cv::CAP_GSTREAMER);
 }
