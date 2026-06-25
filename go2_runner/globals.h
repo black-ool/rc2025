@@ -26,9 +26,10 @@ extern bool found_turn;
 extern int obstacle_avoidance_state;
 
 // =============================================================================
-// case0 第二段巡线标记 (case1 避障完成后设为 true)
+// case0 巡线标记
 // =============================================================================
-extern bool g_case0_second_pass;
+extern bool g_case0_second_pass;     // case1 完成后设为 true（第二段巡线）
+extern bool g_case0_skip_init;       // --task 0 时跳过跳跃/启动
 
 // =============================================================================
 // ArUco

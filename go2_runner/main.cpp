@@ -222,6 +222,8 @@ int main(int argc, char **argv)
         else if (arg == "--task" && i + 1 < argc)
         {
             g_force_task = atoi(argv[++i]);
+            if (g_force_task == 0)
+                g_case0_skip_init = true;  // --task 0: 跳过跳跃，直接纯巡线
             cout << "[Config] Force task mode: Flag_Task locked to " << g_force_task << endl;
         }
         else

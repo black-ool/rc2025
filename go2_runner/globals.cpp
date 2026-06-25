@@ -16,8 +16,9 @@ bool found_turn = false;
 // 避障阶段
 int obstacle_avoidance_state = 0;
 
-// case0 第二段巡线标记
+// case0 巡线标记
 bool g_case0_second_pass = false;
+bool g_case0_skip_init = false;
 
 // ArUco
 std::atomic<int> g_last_aruco_id(-1);

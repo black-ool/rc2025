@@ -49,6 +49,7 @@ add_executable(rc2025_run
     visualizer.cpp
     aruco_server.cpp
     app_runtime.cpp
+    line_follow.cpp
     cases/case0.cpp
     cases/case1.cpp
     cases/case2.cpp
