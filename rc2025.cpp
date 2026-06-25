@@ -3,16 +3,14 @@
 // #include <opencv2/aruco.hpp>
 
 #include <unitree/robot/go2/sport/sport_client.hpp>
+#include <unitree/robot/go2/obstacles_avoid/obstacles_avoid_client.hpp>
 #include <unitree/robot/channel/channel_subscriber.hpp>
-#include <unitree/robot/channel/channel_factory.hpp>
 #include <unitree/common/time/time_tool.hpp>
 #include <unitree/idl/go2/SportModeState_.hpp>
 #include <unitree/idl/ros2/PointStamped_.hpp>
 
 #include <chrono>
 #include <cmath>
-#include <algorithm>
-#include <deque>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -22,6 +20,16 @@
 #include <unistd.h>
 #include <thread>
 #include <atomic>
+#include <csignal>
+
+double safeRange(double raw) 
+{
+    if (raw > 0.1 && raw < 5.0) 
+    {
+        return raw;
+    }
+    return 999.0; // 无效值标记
+}
 
 #define TOPIC_RANGE_INFO "rt/utlidar/range_info"
 #define TOPIC_HIGHSTATE "rt/sportmodestate"
@@ -30,125 +38,39 @@ using namespace unitree::robot;
 using namespace cv;
 using namespace std;
 
-// =============================================================================
-// 标定与话题（相机内参、DDS 话题名）
-// =============================================================================
-/** 前视 RGB 相机内参与畸变（请按实机标定替换） */
+// ---- 全局标志：Ctrl+C 时安全退出 ----
+static std::atomic<bool> g_exit_requested(false);
+
+void signalHandler(int sig)
+{
+    if (sig == SIGINT)
+    {
+        std::cout << "\n[SIGINT] Ctrl+C caught, will exit after cleanup..." << std::endl;
+        g_exit_requested = true;
+    }
+}
+
+/* Camera intrinsics for the **front** RGB camera (replace with yours) */
 static const Mat K = (Mat_<double>(3, 3) << 929.7797, 0, 629.6662,
                       0, 926.7584, 335.6207,
                       0, 0, 1);
 static const Mat D = (Mat_<double>(1, 4) << -0.4157, 0.1327, 0, 0);
 
-// =============================================================================
-// 可调参数（仅 constexpr，便于集中标定；勿在此处声明运行时变量）
-// =============================================================================
-// --- 雷达滤波 ---
-/** 测距 EMA 系数，越大越跟手、越小越平滑 */
-static constexpr float kRangeEmaAlpha = 0.35f;
+/* ------------------------------------------------------------------ */
+/* -------------------  Global navigation state  -------------------- */
+double px = 0, py = 0, yaw = 0;     // body pose
+double px0 = 0, py0 = 0, yaw0 = 0;  // pose at start
+int Flag_Task = 0;                  // main FSM flag
 
-// --- case0 → case1：窄过道入门（约 0.6 m 宽 → 居中时左右约 0.3 m）---
-/** 起跳后沿局部前向 lx 至少前进该距离后才允许雷达触发进入 case1，防止落点误触发 */
-static constexpr double kCase0PostJumpMinForward_m = 0.45;
-/** 单侧距离落在该区间 (m) 视为贴近过道一侧墙（居中） */
-static constexpr float kEnterMazeSideLo_m = 0.18f;
-static constexpr float kEnterMazeSideHi_m = 0.48f;
-/** 左右之和在该区间 (m) 视为窄过道截面 */
-static constexpr float kEnterMazeSideSumLo_m = 0.45f;
-static constexpr float kEnterMazeSideSumHi_m = 0.88f;
-static constexpr int kEnterMazeStableFrames = 4;
-
-// --- case1：迷宫 —— 两次 180° 掉头；第 1 次路口判定同前+左转；第 2 次前进判定路口+右转（稳定帧同第一次）---
-static constexpr int kCase1NumUTurns = 2;
-/** 前方视为「贴墙/路口」的距离上限 (m)，略宽于半宽以抑制噪声 */
-static constexpr float kMazeJunctionFront_m = 0.45f;
-/** 该侧距离大于此值 (m) 视为路口一侧明显开阔，可转 90° */
-static constexpr float kMazeSideOpen_m = 0.52f;
-/** 路口条件连续满足的帧数 */
-static constexpr int kMazeJunctionStableFrames = 3;
-/** 刚进入 case1 后若干帧内禁止第 1 次路口判定，避免尚未完全进入窄道就掉头 */
-static constexpr int kCase1PostEntryDelayFrames = 55;
-/** 完成转弯后的冷却帧，避免同一路口重复触发 */
-static constexpr int kMazeTurnCooldownFrames = 20;
-/** 180° 弧线耗时更长 */
-static constexpr int kMazeTurnTimeoutFrames = 700;
-/** 两次 180° 后第 3 次路口判定时左转 90° 弧线的超时帧数 */
-static constexpr int kMazeArc90TimeoutFrames = 500;
-/** 过道内横偏速度上限与增益（左右差 → vy） */
-static constexpr float kMazeCorridorVyGain = 0.42f;
-static constexpr float kMazeCorridorVyClamp = 0.12f;
-static constexpr float kMazeForwardVx = 0.20f;
-/** 路口一次 180° 掉头：转弯半径 R (m)，协调关系 |ω|≈vx/R（Move 第三参按 rad/s 量级） */
-static constexpr double kCase1UTurnRadius_m = 0.6;
-static constexpr float kCase1UTurnForwardVx = 0.15f;
-/** 第 1 次 180°（左转）略降前向、略增大等效转弯半径，并微左偏，减轻蹭外侧墙 */
-static constexpr float kCase1FirstUTurnVxScale = 0.82f;
-static constexpr double kCase1FirstUTurnRadiusScale = 1.12;
-static constexpr float kCase1FirstUTurnVyBias = 0.04f;
-/** 第 2 次 180°（右转）略降前向、略增大等效半径，并微右偏，减轻蹭后方/侧墙 */
-static constexpr float kCase1SecondUTurnVxScale = 0.85f;
-static constexpr double kCase1SecondUTurnRadiusScale = 1.10;
-static constexpr float kCase1SecondUTurnVyBias = -0.045f;
-// --- 原地转弯（Sport Move 第三分量） ---
-static constexpr double kYawTurnGain = 4.8;
-static constexpr double kYawTurnCmdClamp = 1.25;
-/** 克服控制死区的最小角速度指令幅值 */
-static constexpr double kYawTurnCmdFloor = 0.55;
-/** 认为转弯到位的最大航向误差 (rad) */
-static constexpr double kYawTurnDoneErrRad = 0.10;
-
-// --- 雷达安全裕量：低于阈值或 inf 时向反方向平移/减速（使用原始 ob_* 判定 inf）---
-static constexpr float kClearMinSide_m = 0.2f;
-static constexpr float kClearMinFront_m = 0.4f;
-static constexpr float kClearSideGain = 3.0f;
-static constexpr float kClearFrontGain = 2.0f;
-/** 侧向修正上限（与 Move 第二参数一致：左近减 vy、右近加 vy） */
-static constexpr float kClearVyAbsMax = 0.38f;
-/** 前向过近时允许的最大后退分量（vx 可减至 -该值） */
-static constexpr float kClearVxRetreatMax = 0.28f;
-
-// =============================================================================
-// 全局状态（传感器、位姿、任务机）
-// =============================================================================
-float ob_x = 0, ob_y = 0, ob_z = 0;       // 雷达原始测距 (PointStamped x/y/z)
-float ob_x_f = 0, ob_y_f = 0, ob_z_f = 0; // 滤波后测距，用于控制
-double px = 0, py = 0, yaw = 0;           // 机体世界系位姿（来自 sportmodestate）
-double px0 = 0, py0 = 0, yaw0 = 0;        // 程序启动时刻位姿，用于 transformLocal
-int Flag_Task = 0;                        // 主状态机 case 编号
-
-int start_jump_times = 0;   // 起点前跳次数
-int end_jump_times = 0;     // 终点前跳次数
+/* -------------------  Safety Zone  -------------------- */
+int start_jump_times = 0;
+int end_jump_times = 0;
 bool found_turn = false;
+int obstacle_avoidance_state = 0;
 
-/** case1：0 巡航；1 执行 180° 掉头；2 执行左转 90° 弧线 */
-int g_maze_nav = 0;
-double g_maze_turn_target = 0.;
-int g_maze_junc_stable = 0;
-int g_maze_turn_cd = 0;
-int g_maze_turn_frm = 0;
-/**
- * case1 已完成 180° 掉头次数：0→未做；1→已完成第 1 次（左转 180°）；2→已完成第 2 次（右转 180°）。
- * 触发下一机动时严格按该计数绑定：仅 seg==0 启动左转 180°，仅 seg==1 启动右转 180°，仅 seg==2 且未做 90° 时启动左转 90°。
- */
-int g_case1_seg = 0;
-/** 两次 180° 后第 3 次路口判定触发的左转 90° 是否已执行 */
-bool g_case1_left90_done = false;
-/** 两次 180° 完成后，路口判定连续满足的帧计数（用于第 3 次触发 90°） */
-int g_case1_post90_stable = 0;
-/** 进入 case1 后倒计时：>0 时禁止「第 1 次」180° 的路口累加与触发（每帧减 1） */
-int g_case1_entry_delay_frm = 0;
-/**
- * 当前协调弧线的角速度方向（勿用 err 符号代替）：+1 左转/CCW，-1 右转/CW。
- * yaw±π 在角度上为同一点，wrapAngle 后最短路径 err 总同号，会导致两次 180° 实际同向旋转。
- */
-int g_case1_coord_w_sign = 0;
-/** 迷宫 case1 三段完成后进入 case2 时先仅停车占位（后续再接台阶/巡线逻辑） */
-bool g_case2_post_maze_placeholder = false;
-
+/* Global variable to store last detected marker id */
 std::atomic<int> g_last_aruco_id(-1);
 
-// =============================================================================
-// 辅助线程：ArUco ID 经 TCP 写入 g_last_aruco_id
-// =============================================================================
 void aruco_socket_server(int port = 5005)
 {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -184,34 +106,62 @@ void aruco_socket_server(int port = 5005)
     close(server_fd);
 }
 
-// =============================================================================
-// DDS 回调（其它线程/通道触发；勿在此做耗时阻塞）
-// =============================================================================
+/* Utility: convert pose to local frame aligned with (px0,py0,yaw0) */
+static inline void transformLocal(double x, double y, double yaw_now,
+                                  double &lx, double &ly, double &dyaw)
+{
+    double c = cos(yaw0), s = sin(yaw0);
+    lx = (x - px0) * c + (y - py0) * s;
+    ly = -(x - px0) * s + (y - py0) * c;
+    dyaw = yaw_now - yaw0;
+    if (dyaw > M_PI)
+        dyaw -= 2 * M_PI;
+    if (dyaw < -M_PI)
+        dyaw += 2 * M_PI;
+}
+
+/* ------------------------------------------------------------------ */
+/* ------------------  ROS2 / RTDDS Call-backs  --------------------- */
+/* Global variables for lidar distances (x=front, y=left, z=right) */
+double g_lidar_front_dist = 999.0;  // Front distance (x)
+double g_lidar_left_dist  = 999.0;  // Left distance (y)
+double g_lidar_right_dist = 999.0;  // Right distance (z)
+// EMA-filtered versions for smoother control (alpha=0.35)
+double g_lidar_front_f = 999.0;
+double g_lidar_left_f  = 999.0;
+double g_lidar_right_f = 999.0;
+static bool g_have_front = false, g_have_left = false, g_have_right = false;
+static constexpr float kRangeEmaAlpha = 0.35f;
+
 void rangeCB(const void *m)
 {
-    auto *p = (const geometry_msgs::msg::dds_::PointStamped_ *)m;
-    const float rx = p->point().x();
-    const float ry = p->point().y();
-    const float rz = p->point().z();
-    ob_x = rx;
-    ob_y = ry;
-    ob_z = rz;
+    auto *msg = static_cast<const geometry_msgs::msg::dds_::PointStamped_ *>(m);
+    double rx = msg->point().x();  // front
+    double ry = msg->point().y();  // left
+    double rz = msg->point().z();  // right
 
-    static bool have_x = false, have_y = false, have_z = false;
-    auto ema = [](float raw, float &out, bool &have) {
-        if (!std::isfinite(raw))
-            return;
-        if (!have)
-        {
-            out = raw;
-            have = true;
-        }
-        else
-            out = out * (1.f - kRangeEmaAlpha) + raw * kRangeEmaAlpha;
-    };
-    ema(rx, ob_x_f, have_x);
-    ema(ry, ob_y_f, have_y);
-    ema(rz, ob_z_f, have_z);
+    // Update raw values (valid range 0.01~10.0m)
+    if (rx > 0.01 && rx < 10.0) {
+        g_lidar_front_dist = rx;
+        if (!g_have_front) { g_lidar_front_f = rx; g_have_front = true; }
+        else g_lidar_front_f = g_lidar_front_f * (1.0 - kRangeEmaAlpha) + rx * kRangeEmaAlpha;
+    }
+    if (ry > 0.01 && ry < 10.0) {
+        g_lidar_left_dist = ry;
+        if (!g_have_left) { g_lidar_left_f = ry; g_have_left = true; }
+        else g_lidar_left_f = g_lidar_left_f * (1.0 - kRangeEmaAlpha) + ry * kRangeEmaAlpha;
+    }
+    if (rz > 0.01 && rz < 10.0) {
+        g_lidar_right_dist = rz;
+        if (!g_have_right) { g_lidar_right_f = rz; g_have_right = true; }
+        else g_lidar_right_f = g_lidar_right_f * (1.0 - kRangeEmaAlpha) + rz * kRangeEmaAlpha;
+    }
+
+    static int count = 0;
+    if (++count % 100 == 0) {
+        std::cout << "[RANGE] front=" << g_lidar_front_f << " left=" << g_lidar_left_f
+                  << " right=" << g_lidar_right_f << " (raw: x=" << rx << " y=" << ry << " z=" << rz << ")" << std::endl;
+    }
 }
 
 class StateCB
@@ -227,23 +177,6 @@ public:
     }
 };
 
-/** 将世界系位姿转换到以 (px0,py0,yaw0) 为原点的局部前向坐标系 */
-static inline void transformLocal(double x, double y, double yaw_now,
-                                  double &lx, double &ly, double &dyaw)
-{
-    double c = cos(yaw0), s = sin(yaw0);
-    lx = (x - px0) * c + (y - py0) * s;
-    ly = -(x - px0) * s + (y - py0) * c;
-    dyaw = yaw_now - yaw0;
-    if (dyaw > M_PI)
-        dyaw -= 2 * M_PI;
-    if (dyaw < -M_PI)
-        dyaw += 2 * M_PI;
-}
-
-// =============================================================================
-// 工具函数（纯计算 / 无 DDS；可配合单元测试）
-// =============================================================================
 // Add PID_Yaw and PID_Yaw1 functions from v1_code.cpp
 float PID_Yaw(float expect, float err)
 {
@@ -267,853 +200,205 @@ float PID_Yaw1(float expect, float err)
     return std::max(-2.0f, std::min(2.0f, output));
 }
 
-static inline float safeRange(float v, float fallback = 5.0f)
-{
-    if (!std::isfinite(v))
-        return fallback;
-    return std::fabs(v);
-}
-
-static inline double wrapAngle(double a)
-{
-    while (a > M_PI)
-        a -= 2 * M_PI;
-    while (a <= -M_PI)
-        a += 2 * M_PI;
-    return a;
-}
-
-/** Sport Move 第三参数：目标 yaw 误差(rad) -> 建议角速度，需配合 StaticWalk 使用 */
-static inline double yawTurnRateCmd(double err_rad)
-{
-    double c = err_rad * kYawTurnGain;
-    if (std::fabs(c) < kYawTurnCmdFloor && std::fabs(err_rad) > 0.05)
-        c = (err_rad > 0.0 ? kYawTurnCmdFloor : -kYawTurnCmdFloor);
-    return std::max(-kYawTurnCmdClamp, std::min(kYawTurnCmdClamp, c));
-}
-
-/** 进入 case1 时清空迷宫子状态 */
-static inline void resetMazeFsm()
-{
-    g_maze_nav = 0;
-    g_maze_turn_target = 0.;
-    g_maze_junc_stable = 0;
-    g_maze_turn_cd = 0;
-    g_maze_turn_frm = 0;
-    g_case1_seg = 0;
-    g_case1_left90_done = false;
-    g_case1_post90_stable = 0;
-    g_case1_entry_delay_frm = kCase1PostEntryDelayFrames;
-    g_case1_coord_w_sign = 0;
-    g_case2_post_maze_placeholder = false;
-}
-
-/** 滤波距离均落在窄过道「居中」区间，或左右之和符合约 0.6 m 过道截面 */
-static inline bool isInNarrowCorridor(float left, float right)
-{
-    const bool band_lr = (left >= kEnterMazeSideLo_m && left <= kEnterMazeSideHi_m && right >= kEnterMazeSideLo_m
-                          && right <= kEnterMazeSideHi_m);
-    const float s = left + right;
-    const bool sum_ok =
-        (s >= kEnterMazeSideSumLo_m && s <= kEnterMazeSideSumHi_m && std::min(left, right) > 0.12f);
-    return band_lr || sum_ok;
-}
-
-/** 路口：前向较近，且至少一侧明显开阔（与地图说明一致） */
-static inline bool isMazeJunctionCandidate(float front, float left, float right)
-{
-    if (!(front < kMazeJunctionFront_m))
-        return false;
-    return (left > kMazeSideOpen_m) || (right > kMazeSideOpen_m);
-}
-
-/**
- * 开始一次 180° 掉头：turn_left=true 为左转（+π），false 为右转（-π）。
- * 目标航向 yaw±π 在圆上为同一点，故角速度方向由 g_case1_coord_w_sign 记录，勿仅靠 err 符号。
+/* ------------------------------------------------------------------ */
+/* ---------------  Visual Obstacle Detection  ---------------------- */
+/*
+ * Detect obstacles in the upper-middle region of the image.
+ * Strategy:
+ *   - Floor/ground is usually bright and uniform in the lower part
+ *   - Obstacles appear as darker, textured regions in the upper-middle
+ *   - Use edge density or color variance to detect non-floor regions
+ *
+ * Returns true if obstacle detected within threshold distance (estimated)
  */
-static inline void case1BeginUTurn(bool turn_left)
+bool detectObstacleVisual(const Mat &frame, double &obstacle_score, Mat &debug_img)
 {
-    g_maze_turn_target = wrapAngle(yaw + (turn_left ? M_PI : -M_PI));
-    g_case1_coord_w_sign = turn_left ? 1 : -1;
-    g_maze_nav = 1;
-    g_maze_turn_frm = 0;
+    Mat roi = frame.clone();
+    debug_img = roi;
+
+    // ROI: upper-middle region (where obstacles would appear)
+    // Skip top 1/3 (horizon/sky) and bottom 1/3 (floor close to robot)
+    int h = roi.rows;
+    int w = roi.cols;
+    int y_start = h / 4;       // 25% from top
+    int y_end = h * 2 / 3;     // 66% from top
+    int x_start = w / 4;       // 25% from left
+    int x_end = w * 3 / 4;     // 75% from left (center region)
+
+    Mat roi_region = roi(Rect(x_start, y_start, x_end - x_start, y_end - y_start));
+
+    // Convert to HSV for better color-based detection
+    Mat hsv, mask;
+    cvtColor(roi_region, hsv, COLOR_BGR2HSV);
+
+    // Detect non-floor regions:
+    // Floor is usually bright (high V) and low saturation (low S)
+    // Obstacles tend to have more color variation and lower brightness
+
+    // Method 1: Edge density - obstacles have more edges than floor
+    Mat gray, edges;
+    cvtColor(roi_region, gray, COLOR_BGR2GRAY);
+    Canny(gray, edges, 50, 150);
+
+    int edge_pixels = countNonZero(edges);
+    int total_pixels = edges.rows * edges.cols;
+    double edge_ratio = (double)edge_pixels / total_pixels;
+
+    // Method 2: Brightness variance - obstacles create more variance
+    Scalar mean, stddev;
+    meanStdDev(gray, mean, stddev);
+    double brightness_std = stddev[0];
+
+    // Combine metrics
+    obstacle_score = edge_ratio * 100 + brightness_std * 0.5;
+
+    // Draw debug info
+    rectangle(debug_img, {x_start, y_start}, {x_end, y_end}, {255, 0, 0}, 2);
+    putText(debug_img, format("Edge:%.2f%% Var:%.1f Score:%.1f",
+              edge_ratio * 100, brightness_std, obstacle_score),
+            {10, h - 20}, FONT_HERSHEY_SIMPLEX, 0.6, {0, 255, 255}, 1);
+
+    // Threshold: tune based on testing
+    // Higher score = more likely obstacle
+    bool obstacle_detected = (edge_ratio > 0.05 || brightness_std > 40);
+
+    return obstacle_detected;
 }
 
-/** 两次 180° 后第 3 次路口判定时：左转 90° 协调弧线，R 同 kCase1UTurnRadius_m */
-static inline void case1BeginLeft90Arc()
+/* Simple line-following detection */
+bool detectLine(const Mat &undist, double &err, int &cnt, Mat &debug_img)
 {
-    g_maze_turn_target = wrapAngle(yaw + M_PI / 2.0);
-    g_case1_coord_w_sign = 1;
-    g_maze_nav = 2;
-    g_maze_turn_frm = 0;
-}
+    // 先初始化 debug_img 为 undist 的副本
+    debug_img = undist.clone();
+    
+    Mat gray, blur, bin;
+    cvtColor(undist, gray, COLOR_BGR2GRAY);
+    GaussianBlur(gray, blur, {5, 5}, 0);
 
-/** 第二次掉头前的路口触发：与第一次相同的判定（isMazeJunctionCandidate + 同稳定帧）；可改为纯前向 */
-static inline bool isCase1SecondJunctionTrigger(float front, float left, float right)
-{
-    return isMazeJunctionCandidate(front, left, right);
-}
+    // Detect dark lines: use THRESH_BINARY_INV to highlight DARK regions
+    // pixels < threshold become WHITE (255), others become BLACK (0)
+    // 降低阈值到更低的值，只检测真正的黑线
+    static int debug_threshold = 50;  // 降低到 50，如果还是检测到太多浅色区域
+    threshold(blur, bin, debug_threshold, 255, THRESH_BINARY_INV);
 
-static inline float rawRangeMag(float r)
-{
-    return std::isfinite(r) ? std::fabs(r) : 0.f;
-}
-
-/** 直行阶段仅用前向安全距离修正 vx（不参与左右侧距） */
-static inline void applyRangeClearanceFrontOnly(float raw_front, float &vx)
-{
-    const float dF = rawRangeMag(raw_front);
-    if (!std::isfinite(raw_front) || dF < kClearMinFront_m)
+    // 形态学开运算（先腐蚀后膨胀）：去除"入口"等文字笔画的孤立噪点
+    // 3x3 核保留细线条，配合下游 spread 检查排除文字
     {
-        const float deficit =
-            !std::isfinite(raw_front) ? kClearMinFront_m : (kClearMinFront_m - dF);
-        vx -= std::min(kClearVxRetreatMax, deficit * kClearFrontGain);
-        vx = std::max(-kClearVxRetreatMax, vx);
+        Mat kernel = getStructuringElement(MORPH_RECT, Size(3, 3));
+        morphologyEx(bin, bin, MORPH_OPEN, kernel);
     }
-}
+    
+    // ROI: bottom narrow strip (closer to robot)
+    int roi_height = 40;
+    int roi_y_start = blur.rows - roi_height;
+    if (roi_y_start < 0) roi_y_start = 0;
+    
+    // Draw ROI rectangle on image for debugging
+    rectangle(debug_img, {0, roi_y_start}, {blur.cols, blur.rows}, {255, 0, 0}, 1);
 
-/**
- * 在 Sport Move(vx, vy, w) 下叠加安全修正：左 ob_y 过小或无效 → vy 减小（向机体右侧平移）；
- * 右 ob_z 过小或无效 → vy 增大；前 ob_x 过小或无效 → 减小 vx（可后退）直至回到阈值以上。
- * 应在写出每一帧期望 vx、vy 之后调用。
- */
-static inline void applyRangeClearance(float raw_front, float raw_left, float raw_right, float &vx,
-                                       float &vy)
-{
-    const float dL = rawRangeMag(raw_left);
-    const float dR = rawRangeMag(raw_right);
-    const float dF = rawRangeMag(raw_front);
+    err = 0;
+    cnt = 0;
+    const int roi_width = bin.cols;
+    vector<int> col_count(roi_width, 0);  // 每列白色像素计数
 
-    if (!std::isfinite(raw_left) || dL < kClearMinSide_m)
+    // Only scan the ROI region
+    for (int r = roi_y_start; r < blur.rows; ++r)
     {
-        const float deficit =
-            !std::isfinite(raw_left) ? kClearMinSide_m : (kClearMinSide_m - dL);
-        vy -= std::min(kClearVyAbsMax, deficit * kClearSideGain);
-    }
-    if (!std::isfinite(raw_right) || dR < kClearMinSide_m)
-    {
-        const float deficit =
-            !std::isfinite(raw_right) ? kClearMinSide_m : (kClearMinSide_m - dR);
-        vy += std::min(kClearVyAbsMax, deficit * kClearSideGain);
-    }
-    vy = std::max(-kClearVyAbsMax, std::min(kClearVyAbsMax, vy));
-
-    if (!std::isfinite(raw_front) || dF < kClearMinFront_m)
-    {
-        const float deficit =
-            !std::isfinite(raw_front) ? kClearMinFront_m : (kClearMinFront_m - dF);
-        vx -= std::min(kClearVxRetreatMax, deficit * kClearFrontGain);
-        vx = std::max(-kClearVxRetreatMax, vx);
-    }
-}
-
-/** case1 巡航一帧：需 StaticWalk 与 Move 配合，否则 StopMove 后可能不再前进 */
-static inline void case1CorridorFollowFrame(go2::SportClient &sc, float left, float right, float side_sum)
-{
-    sc.StaticWalk();
-    float vx = kMazeForwardVx;
-    float vy = 0.f;
-    if (side_sum > 0.05f)
-        vy = std::max(-kMazeCorridorVyClamp,
-                      std::min(kMazeCorridorVyClamp, (left - right) * kMazeCorridorVyGain));
-    applyRangeClearance(ob_x, ob_y, ob_z, vx, vy);
-    sc.Move(vx, vy, 0.f);
-}
-
-/**
- * 180° 协调掉头单帧（|ω|≈vx/R）；依赖 g_maze_turn_target、g_maze_turn_frm。
- * @return 0 进行中；1 到位；2 超时
- */
-static inline int case1UTurnTickFrame(go2::SportClient &sc)
-{
-    sc.StaticWalk();
-    const double err = wrapAngle(g_maze_turn_target - yaw);
-    ++g_maze_turn_frm;
-
-    if (std::fabs(err) <= kYawTurnDoneErrRad)
-    {
-        sc.StopMove();
-        g_maze_turn_frm = 0;
-        g_maze_turn_cd = kMazeTurnCooldownFrames;
-        g_maze_nav = 0;
-        g_maze_junc_stable = 0;
-        return 1;
-    }
-    if (g_maze_turn_frm > kMazeTurnTimeoutFrames)
-    {
-        sc.StopMove();
-        g_maze_nav = 0;
-        g_maze_turn_frm = 0;
-        g_maze_turn_cd = kMazeTurnCooldownFrames * 2;
-        return 2;
-    }
-
-    float vx = kCase1UTurnForwardVx;
-    if (g_case1_seg == 0)
-        vx *= kCase1FirstUTurnVxScale;
-    else if (g_case1_seg == 1)
-        vx *= kCase1SecondUTurnVxScale;
-    applyRangeClearanceFrontOnly(ob_x, vx);
-    const double vx_use = std::max((double)vx, 1e-4);
-    double R_eff = kCase1UTurnRadius_m;
-    if (g_case1_seg == 0)
-        R_eff *= kCase1FirstUTurnRadiusScale;
-    else if (g_case1_seg == 1)
-        R_eff *= kCase1SecondUTurnRadiusScale;
-    double w_mag = vx_use / R_eff;
-    if (w_mag < kYawTurnCmdFloor)
-        w_mag = kYawTurnCmdFloor;
-    w_mag = std::min(w_mag, kYawTurnCmdClamp);
-    const int w_dir = (g_case1_coord_w_sign >= 0 ? 1 : -1);
-    float vy = 0.f;
-    if (g_case1_seg == 0 && g_case1_coord_w_sign > 0)
-        vy = kCase1FirstUTurnVyBias;
-    else if (g_case1_seg == 1 && g_case1_coord_w_sign < 0)
-        vy = kCase1SecondUTurnVyBias;
-    const double w_cmd = (double)w_dir * w_mag;
-    sc.Move(vx, vy, w_cmd);
-    return 0;
-}
-
-/**
- * 左转 90° 协调弧线单帧：|ω|≈vx/R，R=kCase1UTurnRadius_m。
- * @return 0 进行中；1 到位；2 超时
- */
-static inline int case1Arc90LeftTickFrame(go2::SportClient &sc)
-{
-    sc.StaticWalk();
-    const double err = wrapAngle(g_maze_turn_target - yaw);
-    ++g_maze_turn_frm;
-
-    if (std::fabs(err) <= kYawTurnDoneErrRad)
-    {
-        sc.StopMove();
-        g_maze_turn_frm = 0;
-        g_maze_turn_cd = kMazeTurnCooldownFrames;
-        g_maze_nav = 0;
-        g_maze_junc_stable = 0;
-        g_case1_post90_stable = 0;
-        g_case1_left90_done = true;
-        return 1;
-    }
-    if (g_maze_turn_frm > kMazeArc90TimeoutFrames)
-    {
-        sc.StopMove();
-        g_maze_nav = 0;
-        g_maze_turn_frm = 0;
-        g_maze_turn_cd = kMazeTurnCooldownFrames * 2;
-        g_case1_left90_done = true;
-        return 2;
-    }
-
-    float vx = kCase1UTurnForwardVx;
-    applyRangeClearanceFrontOnly(ob_x, vx);
-    const double vx_use = std::max((double)vx, 1e-4);
-    double w_mag = vx_use / kCase1UTurnRadius_m;
-    if (w_mag < kYawTurnCmdFloor)
-        w_mag = kYawTurnCmdFloor;
-    w_mag = std::min(w_mag, kYawTurnCmdClamp);
-    const int w_dir = (g_case1_coord_w_sign >= 0 ? 1 : -1);
-    const double w_cmd = (double)w_dir * w_mag;
-    sc.Move(vx, 0.f, w_cmd);
-    return 0;
-}
-
-// =============================================================================
-// 可视化（仅 OpenCV 实时曲线，不参与控制决策）
-// =============================================================================
-namespace {
-
-constexpr size_t kRangePlotSamples = 600;
-constexpr int kPlotW = 960;
-constexpr int kPlotH = 420;
-
-/** Append raw sensor value (no clamp / no sentinel for inf). */
-static inline void pushRangeSampleRaw(std::deque<float> &q, float v)
-{
-    q.push_back(v);
-    while (q.size() > kRangePlotSamples)
-        q.pop_front();
-}
-
-static void autoYAxisFinite(const std::deque<float> &data, float &ymin, float &ymax)
-{
-    bool any = false;
-    float lo = 0.f, hi = 0.f;
-    for (float v : data)
-    {
-        if (!std::isfinite(v))
-            continue;
-        if (!any)
+        const uchar *row = bin.ptr(r);
+        for (int c = 0; c < roi_width; ++c)
         {
-            lo = hi = v;
-            any = true;
-        }
-        else
-        {
-            lo = std::min(lo, v);
-            hi = std::max(hi, v);
+            if (row[c] > 0)  // White pixel detected
+            {
+                col_count[c]++;
+                cnt++;
+            }
         }
     }
-    if (!any)
-    {
-        ymin = 0.f;
-        ymax = 5.f;
-        return;
+    
+    // Debug info
+    int roi_total_pixels = (blur.rows - roi_y_start) * roi_width;
+    double roi_percentage = (double)cnt / roi_total_pixels * 100;
+
+    // —————— 水平投影峰值法找线条中心 ——————
+    // 用每列白色像素计数代替平均值，避免"入口"文字拉偏质心
+    int peak_col = -1;
+    int peak_count = 0;
+    for (int c = 0; c < roi_width; ++c) {
+        if (col_count[c] > peak_count) {
+            peak_count = col_count[c];
+            peak_col = c;
+        }
     }
-    ymin = lo;
-    ymax = hi;
-    float span = ymax - ymin;
-    float pad = std::max(0.08f, span * 0.12f);
-    ymin -= pad;
-    ymax += pad;
-    if (ymax - ymin < 0.2f)
-    {
-        ymin -= 0.1f;
-        ymax += 0.1f;
+
+    // 只有当峰值列至少有 5 个像素（线条是连续的，文字笔画分散不会形成单列高峰）
+    if (peak_count >= 5) {
+        err = peak_col - 640;  // 偏差 = 峰值列 - 画面中心
+
+        int center_x = peak_col;
+        // Clamp to image bounds
+        center_x = max(0, min(1279, center_x));
+        
+        line(debug_img, {center_x, blur.rows - roi_height/2}, 
+             {center_x, blur.rows}, {0, 255, 0}, 2);
+        circle(debug_img, {center_x, blur.rows - roi_height/2}, 8, {0, 255, 0}, 2);
+    } else {
+        err = 0;  // 无有效峰值，fallback
     }
+
+    // 检查是否为有效线条
+    // 总像素 cnt 不能太少（无线条）也不能太多（全白/噪音）
+    // 峰值 peak_count 至少 5 列以上（线条是连续的垂直带）
+    if (cnt >= 50 && cnt <= 50000 && peak_count >= 5)
+    {
+        putText(debug_img, format("Line: err=%.1f cnt=%d peak=%d thresh=%d %.1f%%", 
+                 err, cnt, peak_count, debug_threshold, roi_percentage),
+                {10, 30}, FONT_HERSHEY_SIMPLEX, 0.7, {0, 255, 0}, 2);
+        
+        // Print success info to console
+        cout << "[LINE DETAIL] SUCCESS: err=" << err << " cnt=" << cnt << " peak=" << peak_count
+             << " percentage=" << roi_percentage << "%" << endl;
+        
+        return true;
+    }
+
+    // Debug: show why line not detected
+    string reason;
+    int status_color = 0;  // 0=red for error, 1=yellow for warning
+    
+    if (cnt < 50) {
+        reason = format("NO LINE: cnt=%d (<50)", cnt);
+        status_color = 0;
+    } else if (cnt > 50000) {
+        reason = format("NO LINE: cnt=%d (>50000)", cnt);
+        status_color = 0;
+    } else if (peak_count < 5) {
+        reason = format("NO LINE: peak=%d (<5) text noise?", peak_count);
+        status_color = 1;  // Yellow: 可能是文字干扰
+    } else {
+        reason = format("NO LINE: bad ROI or lighting");
+        status_color = 1;
+    }
+    
+    putText(debug_img, reason, {10, 60}, FONT_HERSHEY_SIMPLEX, 0.6, 
+            status_color == 0 ? Scalar(0, 0, 255) : Scalar(0, 255, 255), 2);
+
+    // Print detailed debug info to console periodically
+    static int print_counter = 0;
+    print_counter++;
+    if (print_counter % 10 == 0)
+    {
+        cout << "[LINE DEBUG] img_mean=" << mean(gray)[0] 
+             << " roi_total=" << roi_total_pixels
+             << " cnt=" << cnt 
+             << " peak=" << peak_count
+             << " percentage=" << roi_percentage << "%" << endl;
+    }
+
+    return false;
 }
 
-static void autoYAxisFiniteShared(const std::deque<float> &a, const std::deque<float> &b,
-                                  float &ymin, float &ymax)
-{
-    bool any = false;
-    float lo = 0.f, hi = 0.f;
-    auto consider = [&](float v) {
-        if (!std::isfinite(v))
-            return;
-        if (!any)
-        {
-            lo = hi = v;
-            any = true;
-        }
-        else
-        {
-            lo = std::min(lo, v);
-            hi = std::max(hi, v);
-        }
-    };
-    for (float v : a)
-        consider(v);
-    for (float v : b)
-        consider(v);
-    if (!any)
-    {
-        ymin = 0.f;
-        ymax = 5.f;
-        return;
-    }
-    ymin = lo;
-    ymax = hi;
-    float span = ymax - ymin;
-    float pad = std::max(0.08f, span * 0.12f);
-    ymin -= pad;
-    ymax += pad;
-    if (ymax - ymin < 0.2f)
-    {
-        ymin -= 0.1f;
-        ymax += 0.1f;
-    }
-}
-
-/** Polyline skipping non-finite samples (break segments, no invented values). */
-static void drawFinitePolyline(Mat &canvas, int ox, int oy_bot, int w, int h, float ymin, float ymax,
-                               const std::deque<float> &data, const Scalar &line_color,
-                               int n_plot = -1)
-{
-    std::vector<Point> seg;
-    const int n = n_plot > 0 ? std::min(n_plot, static_cast<int>(data.size()))
-                             : static_cast<int>(data.size());
-    for (int i = 0; i < n; ++i)
-    {
-        float v = data[static_cast<size_t>(i)];
-        if (!std::isfinite(v))
-        {
-            if (seg.size() >= 2)
-                polylines(canvas, seg, false, line_color, 2, LINE_AA);
-            seg.clear();
-            continue;
-        }
-        int px = ox + i * w / std::max(1, n - 1);
-        int py = oy_bot - cvRound((v - ymin) / (ymax - ymin + 1e-6f) * h);
-        seg.push_back(Point(px, py));
-    }
-    if (seg.size() >= 2)
-        polylines(canvas, seg, false, line_color, 2, LINE_AA);
-}
-
-static void drawRangeStrip(Mat &canvas, const Rect &band, const std::deque<float> &data,
-                           const char *title, const Scalar &line_color)
-{
-    rectangle(canvas, band, Scalar(32, 32, 32), FILLED);
-    putText(canvas, title, Point(band.x + 8, band.y + 22),
-            FONT_HERSHEY_SIMPLEX, 0.55, Scalar(220, 220, 220), 1, LINE_AA);
-
-    float ymin = 0, ymax = 5;
-    autoYAxisFinite(data, ymin, ymax);
-
-    const int margin_l = 52;
-    const int margin_r = 10;
-    const int margin_t = 30;
-    const int margin_b = 12;
-    int ox = band.x + margin_l;
-    int oy_top = band.y + margin_t;
-    int w = band.width - margin_l - margin_r;
-    int h = band.height - margin_t - margin_b;
-    int oy_bot = oy_top + h;
-
-    if (w < 4 || h < 4 || data.size() < 2)
-    {
-        putText(canvas, "(waiting samples...)", Point(ox, oy_top + h / 2),
-                FONT_HERSHEY_SIMPLEX, 0.5, Scalar(140, 140, 140), 1, LINE_AA);
-        return;
-    }
-
-    for (int gi = 0; gi <= 4; ++gi)
-    {
-        float g = ymin + (ymax - ymin) * (gi / 4.f);
-        int gy = oy_bot - cvRound((g - ymin) / (ymax - ymin + 1e-6f) * h);
-        line(canvas, Point(ox, gy), Point(ox + w, gy), Scalar(55, 55, 55), 1, LINE_AA);
-        putText(canvas, format("%.2f", g), Point(band.x + 4, gy + 4),
-                FONT_HERSHEY_SIMPLEX, 0.35, Scalar(110, 110, 110), 1, LINE_AA);
-    }
-
-    drawFinitePolyline(canvas, ox, oy_bot, w, h, ymin, ymax, data, line_color, -1);
-
-    std::string cur_txt = "now: ";
-    if (!data.empty() && std::isfinite(data.back()))
-        cur_txt += format("%.4f", data.back());
-    else if (!data.empty())
-        cur_txt += "non-finite";
-    else
-        cur_txt += "---";
-    putText(canvas, cur_txt, Point(ox + w - 240, band.y + 22),
-            FONT_HERSHEY_SIMPLEX, 0.5, line_color, 1, LINE_AA);
-}
-
-/** ob_y and ob_z in one plot: shared vertical axis from raw finite samples only. */
-static void drawRangeStripYzShared(Mat &canvas, const Rect &band, const std::deque<float> &qy,
-                                   const std::deque<float> &qz)
-{
-    rectangle(canvas, band, Scalar(32, 32, 32), FILLED);
-    putText(canvas, "ob_y + ob_z (shared Y, raw)", Point(band.x + 8, band.y + 22),
-            FONT_HERSHEY_SIMPLEX, 0.55, Scalar(220, 220, 220), 1, LINE_AA);
-
-    float ymin = 0, ymax = 5;
-    autoYAxisFiniteShared(qy, qz, ymin, ymax);
-
-    const int margin_l = 52;
-    const int margin_r = 10;
-    const int margin_t = 30;
-    const int margin_b = 12;
-    int ox = band.x + margin_l;
-    int oy_top = band.y + margin_t;
-    int w = band.width - margin_l - margin_r;
-    int h = band.height - margin_t - margin_b;
-    int oy_bot = oy_top + h;
-
-    const int n = static_cast<int>(std::min(qy.size(), qz.size()));
-    if (w < 4 || h < 4 || n < 2)
-    {
-        putText(canvas, "(waiting samples...)", Point(ox, oy_top + h / 2),
-                FONT_HERSHEY_SIMPLEX, 0.5, Scalar(140, 140, 140), 1, LINE_AA);
-        return;
-    }
-
-    for (int gi = 0; gi <= 4; ++gi)
-    {
-        float g = ymin + (ymax - ymin) * (gi / 4.f);
-        int gy = oy_bot - cvRound((g - ymin) / (ymax - ymin + 1e-6f) * h);
-        line(canvas, Point(ox, gy), Point(ox + w, gy), Scalar(55, 55, 55), 1, LINE_AA);
-        putText(canvas, format("%.2f", g), Point(band.x + 4, gy + 4),
-                FONT_HERSHEY_SIMPLEX, 0.35, Scalar(110, 110, 110), 1, LINE_AA);
-    }
-
-    drawFinitePolyline(canvas, ox, oy_bot, w, h, ymin, ymax, qy, Scalar(80, 255, 140), n);
-    drawFinitePolyline(canvas, ox, oy_bot, w, h, ymin, ymax, qz, Scalar(200, 120, 255), n);
-
-    putText(canvas, "ob_y", Point(ox + w - 220, band.y + 22),
-            FONT_HERSHEY_SIMPLEX, 0.45, Scalar(80, 255, 140), 1, LINE_AA);
-    putText(canvas, "ob_z", Point(ox + w - 120, band.y + 22),
-            FONT_HERSHEY_SIMPLEX, 0.45, Scalar(200, 120, 255), 1, LINE_AA);
-}
-
-static Mat makeRangePlotMat(const std::deque<float> &qx, const std::deque<float> &qy,
-                            const std::deque<float> &qz)
-{
-    Mat canvas(kPlotH, kPlotW, CV_8UC3, Scalar(20, 20, 20));
-    int bh0 = kPlotH / 2;
-    int bh1 = kPlotH - bh0;
-    drawRangeStrip(canvas, Rect(0, 0, kPlotW, bh0), qx, "ob_x (raw)", Scalar(80, 180, 255));
-    drawRangeStripYzShared(canvas, Rect(0, bh0, kPlotW, bh1), qy, qz);
-    return canvas;
-}
-
-} // namespace
-
-// =============================================================================
-// 运行时对象：DDS 订阅、Sport、相机与 main 同生命周期
-// =============================================================================
-struct AppRuntime {
-    ChannelSubscriber<geometry_msgs::msg::dds_::PointStamped_> sub_range;
-    StateCB stateCB;
-    ChannelSubscriber<unitree_go::msg::dds_::SportModeState_> sub_state;
-    go2::SportClient sc;
-    VideoCapture cap;
-
-    AppRuntime()
-        : sub_range(TOPIC_RANGE_INFO)
-        , sub_state(TOPIC_HIGHSTATE)
-    {}
-};
-
-/** Sport、订阅、初始位姿、GStreamer 前视相机（须先由 main 完成 ChannelFactory::Init） */
-static bool initAppRuntime(AppRuntime &rt, const char *eth_if)
-{
-    // SportClient::Init 必须在任何 ChannelSubscriber::InitChannel 之前完成，
-    // 否则 Cyclone DDS 在创建 DataReader 时可能崩溃（与官方 go2_sport_client 示例顺序一致）。
-    rt.sc.SetTimeout(10.0f);
-    rt.sc.Init();
-    rt.sub_range.InitChannel(rangeCB);
-    rt.sub_state.InitChannel(rt.stateCB);
-    rt.sc.BalanceStand();
-    px0 = px;
-    py0 = py;
-    yaw0 = yaw;
-    const std::string gst_front =
-        std::string("udpsrc address=230.1.1.1 port=1720 multicast-iface=") + eth_if +
-        " ! application/x-rtp, media=video, encoding-name=H264 "
-        "! rtph264depay ! h264parse ! avdec_h264 ! videoconvert "
-        "! video/x-raw,width=1280,height=720,format=BGR ! appsink drop=1";
-    return rt.cap.open(gst_front, CAP_GSTREAMER);
-}
-
-/** 读帧、去畸变、主 FSM、雷达/相机窗口 */
-static int runMainLoop(AppRuntime &rt)
-{
-    go2::SportClient &sc = rt.sc;
-    VideoCapture &cap = rt.cap;
-
-    Mat frame, undist;
-    int fcount = 0;
-    auto t0 = chrono::steady_clock::now();
-
-    while (true)
-    {
-        // ---------- 图像采集与去畸变 ----------
-        if (!cap.read(frame) || frame.empty())
-            break;
-        fcount++;
-        undistort(frame, undist, K, D);
-
-        // ---------- 状态日志（每帧；可后续改为降频或宏开关）----------
-        cout << " Flag_Task: " << Flag_Task << "|ob_x: " << ob_x << "|ob_y: " << ob_y << "|ob_z: " << ob_z << "|px: " << px << "|py: " << py << "|yaw: " << yaw << endl;
-
-        /* FPS overlay */
-        double fps = fcount / chrono::duration<double>(chrono::steady_clock::now() - t0).count();
-        putText(undist, format("FPS %.1f", fps), {10, 30},
-                FONT_HERSHEY_SIMPLEX, 1, {0, 255, 0}, 2);
-
-        // ---------- FSM 公共量：相对起点的局部坐标 ----------
-        double lx, ly, dyaw;
-        transformLocal(px, py, yaw, lx, ly, dyaw);
-        (void)ly;
-        (void)dyaw;
-        switch (Flag_Task)
-        {
-        // ----- case0：起点前跳 + 巡线 → 雷达判定进入窄过道（case1）-----
-        case 0: /* 起点区 —— jump once, then line following until case1 */
-        {
-            // Walk forward briefly, then jump once to cross the starting line
-            if (start_jump_times == 0)
-            {
-                sc.StaticWalk();
-                {
-                    float vx0 = 0.3f, vy0 = 0.f;
-                    applyRangeClearance(ob_x, ob_y, ob_z, vx0, vy0);
-                    sc.Move(vx0, vy0, 0);
-                }
-                this_thread::sleep_for(chrono::milliseconds(2500));
-                sc.StopMove();
-                sc.FrontJump();
-                start_jump_times++;
-                cout << "跳跃完成" << endl;
-                // Wait for the jump to complete before resuming walk
-                this_thread::sleep_for(chrono::milliseconds(1500));
-                break; // Skip line-following this iteration
-            }
-
-            /* 起跳后沿 lx 累计前进距离，与雷达联判进入迷宫 */
-            static double lx_anchor_post_jump = 0;
-            static bool lx_anchor_post_jump_set = false;
-            if (!lx_anchor_post_jump_set)
-            {
-                lx_anchor_post_jump = lx;
-                lx_anchor_post_jump_set = true;
-            }
-            const double forward_since_jump = lx - lx_anchor_post_jump;
-
-            /* 巡线 */
-            /* Basic binary mask & centre-line deviation */
-            Mat gray, blur, bin;
-            cvtColor(undist, gray, COLOR_BGR2GRAY);
-            GaussianBlur(gray, blur, {15, 15}, 0);
-            threshold(blur, bin, 50, 255, THRESH_BINARY_INV);
-
-            // compute mean X of white pixels on bottom rows
-            double err = 0;
-            int cnt = 0;
-            for (int r = blur.rows - 1; r >= blur.rows - 120; --r)
-            {
-                const uchar *row = bin.ptr(r);
-                for (int c = 0; c < bin.cols; ++c)
-                    if (row[c])
-                    {
-                        err += c - 640;
-                        cnt++;
-                    }
-            }
-            err = cnt ? err / cnt : 0;
-
-            double steer = -0.001 * err; // pixel→rad gain
-
-            // Enter static walk mode
-            sc.StaticWalk();
-            sc.Euler(0, 0.25, 0);
-
-            {
-                float vx = 0.25f, vy = 0.f;
-                applyRangeClearance(ob_x, ob_y, ob_z, vx, vy);
-                sc.Move(vx, vy, steer);
-            }
-
-            const float f0 = safeRange(ob_x_f);
-            const float l0 = safeRange(ob_y_f);
-            const float r0 = safeRange(ob_z_f);
-            static int case0_enter_maze_cnt = 0;
-            if (forward_since_jump >= kCase0PostJumpMinForward_m && isInNarrowCorridor(l0, r0))
-                case0_enter_maze_cnt++;
-            else
-                case0_enter_maze_cnt = 0;
-
-            if (case0_enter_maze_cnt >= kEnterMazeStableFrames)
-            {
-                case0_enter_maze_cnt = 0;
-                resetMazeFsm();
-                cout << "[case0] 进入窄过道/迷宫 区段 (lx_fwd=" << forward_since_jump << " m, f=" << f0
-                     << " L=" << l0 << " R=" << r0 << ") → Flag_Task=1" << endl;
-                Flag_Task = 1;
-            }
-        }
-        break;
-
-        // ----- case1：两次 180°；两次后第 3 次路口判定时左转 90° 弧线(R=0.6m) -----
-        case 1:
-        {
-            const float front = safeRange(ob_x_f);
-            const float left = safeRange(ob_y_f);
-            const float right = safeRange(ob_z_f);
-            const float side_sum = left + right;
-
-            sc.Euler(0, 0, 0);
-
-            if (g_maze_nav == 0)
-            {
-                if (g_maze_turn_cd > 0)
-                    --g_maze_turn_cd;
-
-                if (g_case1_entry_delay_frm > 0)
-                {
-                    --g_case1_entry_delay_frm;
-                    g_maze_junc_stable = 0;
-                }
-
-                const bool cd_ok = (g_maze_turn_cd == 0);
-                bool started_maneuver = false;
-
-                /* 仅第 1 次 180° 受入门延时；seg>=1 后不再等待 */
-                const bool first_uturn_armed =
-                    (g_case1_seg > 0) || (g_case1_entry_delay_frm == 0);
-                const bool detect_junction =
-                    (g_case1_seg < kCase1NumUTurns) && cd_ok && first_uturn_armed;
-
-                const bool cand_first =
-                    detect_junction && (g_case1_seg == 0) && isMazeJunctionCandidate(front, left, right);
-                const bool cand_second =
-                    detect_junction && (g_case1_seg == 1) && isCase1SecondJunctionTrigger(front, left, right);
-
-                if (cand_first || cand_second)
-                    ++g_maze_junc_stable;
-                else
-                    g_maze_junc_stable = 0;
-
-                if (detect_junction && g_maze_junc_stable >= kMazeJunctionStableFrames)
-                {
-                    sc.StopMove();
-                    g_maze_junc_stable = 0;
-                    /* 顺序写死：仅 case 0→左转 180°；仅 case 1→右转 180°；无 if-else 链歧义 */
-                    switch (g_case1_seg)
-                    {
-                    case 0:
-                        case1BeginUTurn(true);
-                        started_maneuver = true;
-                        cout << "[case1] 第1次路口触发 (front=" << front << " L=" << left << " R=" << right
-                             << ") → 180° R=" << kCase1UTurnRadius_m << "m 左转 目标yaw=" << g_maze_turn_target
-                             << endl;
-                        break;
-                    case 1:
-                        case1BeginUTurn(false);
-                        started_maneuver = true;
-                        cout << "[case1] 第2次路口触发（前进判定与第一次相同）(front=" << front << " L=" << left
-                             << " R=" << right << ") → 180° R=" << kCase1UTurnRadius_m << "m 右转 目标yaw="
-                             << g_maze_turn_target << endl;
-                        break;
-                    default:
-                        break;
-                    }
-                }
-
-                /* 两次 180° 后：前方第 3 次满足路口判定（稳定帧）→ 左转 90° 弧线（仅 seg==2） */
-                if (!started_maneuver && (g_case1_seg == kCase1NumUTurns) && !g_case1_left90_done && cd_ok)
-                {
-                    if (isMazeJunctionCandidate(front, left, right))
-                        ++g_case1_post90_stable;
-                    else
-                        g_case1_post90_stable = 0;
-
-                    if (g_case1_post90_stable >= kMazeJunctionStableFrames)
-                    {
-                        sc.StopMove();
-                        g_case1_post90_stable = 0;
-                        case1BeginLeft90Arc();
-                        started_maneuver = true;
-                        cout << "[case1] 第3次路口判定 (front=" << front << " L=" << left << " R=" << right
-                             << ") → 左转90°弧线 R=" << kCase1UTurnRadius_m << "m 目标yaw=" << g_maze_turn_target
-                             << endl;
-                    }
-                }
-
-                if (!started_maneuver)
-                    case1CorridorFollowFrame(sc, left, right, side_sum);
-            }
-            else if (g_maze_nav == 1)
-            {
-                const int ut = case1UTurnTickFrame(sc);
-                if (ut == 1)
-                {
-                    ++g_case1_seg;
-                    const double err = wrapAngle(g_maze_turn_target - yaw);
-                    cout << "[case1] 第" << g_case1_seg << "次180°掉头完成 err=" << err;
-                    if (g_case1_seg >= kCase1NumUTurns)
-                        cout << " → 巡航，等待第3次路口判定做90°左弧" << endl;
-                    else
-                        cout << " → 继续前进，等待下一次路口" << endl;
-                    /* 掉头结束已 StopMove；同一帧续走，避免整帧无 Move 体感停车 */
-                    case1CorridorFollowFrame(sc, left, right, side_sum);
-                }
-                else if (ut == 2)
-                    cout << "[case1] 第" << (g_case1_seg + 1) << "次掉头超时" << endl;
-            }
-            else if (g_maze_nav == 2)
-            {
-                const int ar = case1Arc90LeftTickFrame(sc);
-                if (ar == 1)
-                {
-                    const double err = wrapAngle(g_maze_turn_target - yaw);
-                    cout << "[case1] 左转90°弧线完成 err=" << err << " → Flag_Task=2（占位停车）" << endl;
-                    g_case2_post_maze_placeholder = true;
-                    Flag_Task = 2;
-                    /* 弧结束帧内 arc 已 StopMove；立刻发零速 Move，避免整帧无 Move（同掉头后续走） */
-                    sc.StaticWalk();
-                    sc.Euler(0, 0.25, 0);
-                    sc.Move(0.f, 0.f, 0.f);
-                }
-                else if (ar == 2)
-                    cout << "[case1] 左转90°弧线超时" << endl;
-            }
-        }
-        break;
-
-        // ----- case2：巡线接近台阶（原 case7）；迷宫结束后可先仅占位停车 -----
-        case 2: /* 巡线准备过台阶 —— 逻辑同 case 0 巡线部分 */
-        {
-            if (g_case2_post_maze_placeholder)
-            {
-                /* 勿仅用 StopMove：StaticWalk 下需每帧 Move 才稳，否则易失速后倾 */
-                sc.StaticWalk();
-                sc.Euler(0, 0.25, 0);
-                sc.Move(0.f, 0.f, 0.f);
-                break;
-            }
-
-            sc.StaticWalk();
-            sc.Euler(0, 0.25, 0);
-
-            Mat gray7, blur7, bin7;
-            cvtColor(undist, gray7, COLOR_BGR2GRAY);
-            GaussianBlur(gray7, blur7, {15, 15}, 0);
-            threshold(blur7, bin7, 50, 255, THRESH_BINARY_INV);
-
-            double err7 = 0;
-            int cnt7 = 0;
-            for (int r = blur7.rows - 1; r >= blur7.rows - 120; --r)
-            {
-                const uchar *row = bin7.ptr(r);
-                for (int c = 0; c < bin7.cols; ++c)
-                    if (row[c])
-                    {
-                        err7 += c - 640;
-                        cnt7++;
-                    }
-            }
-            err7 = cnt7 ? err7 / cnt7 : 0;
-            double steer7 = -0.001 * err7;
-
-            {
-                float vx = 0.25f, vy = 0.f;
-                applyRangeClearance(ob_x, ob_y, ob_z, vx, vy);
-                sc.Move(vx, vy, steer7);
-            }
-
-            // 此处留给后续台阶检测触发条件（Flag_Task = 3）
-        }
-        break;
-
-        // ----- case3：跳进终点区（原 case8）-----
-        case 3: /* 跳进终点区域 */
-        {
-            if (end_jump_times == 0)
-            {
-                sc.FrontJump();
-                end_jump_times++;
-                this_thread::sleep_for(chrono::milliseconds(2500));
-            }
-            Flag_Task = 4;
-        }
-        break;
-
-        // ----- case4：任务结束（原 case9）-----
-        case 4: /* 终点区 —— stop and celebrate */
-            sc.StopMove();
-            cout << "Mission complete\n";
-            return 0;
-        }
-
-        // ---------- OpenCV：雷达原始曲线 + 前视画面（不参与控制）----------
-        static std::deque<float> range_hist_x, range_hist_y, range_hist_z;
-        pushRangeSampleRaw(range_hist_x, ob_x);
-        pushRangeSampleRaw(range_hist_y, ob_y);
-        pushRangeSampleRaw(range_hist_z, ob_z);
-        imshow("Range ob_x | ob_y+ob_z (raw)", makeRangePlotMat(range_hist_x, range_hist_y, range_hist_z));
-
-        imshow("Go2 Front Cam", undist);
-        if (waitKey(1) == 27)
-            break; // ESC to quit
-    }
-    sc.StopMove();
-    return 0;
-}
-
+/* ------------------------------------------------------------------ */
+/* --------------------------  Main program  ------------------------ */
 int main(int argc, char **argv)
 {
     if (argc < 2)
@@ -1122,17 +407,628 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    // SportClient 构造即会建立 DDS 请求通道，必须先初始化 ChannelFactory（见 AppRuntime 成员顺序）。
+    /* Init Unitree DDS */
     ChannelFactory::Instance()->Init(0, argv[1]);
-    AppRuntime rt;
-    if (!initAppRuntime(rt, argv[1]))
+
+
+    /* Subscribers */
+    ChannelSubscriber<geometry_msgs::msg::dds_::PointStamped_> sub_range(TOPIC_RANGE_INFO);
+    sub_range.InitChannel(rangeCB);
+
+    StateCB stateCB;
+    ChannelSubscriber<unitree_go::msg::dds_::SportModeState_> sub_state(TOPIC_HIGHSTATE);
+    sub_state.InitChannel(stateCB);
+
+    /* Sport client */
+    go2::SportClient sc;
+    sc.SetTimeout(10.0f);
+    sc.Init();
+    sc.BalanceStand();
+
+    /* Obstacles avoid client - for Move/MoveToIncrementPosition */
+    go2::ObstaclesAvoidClient avoid_client;
+    avoid_client.Init();
+    avoid_client.UseRemoteCommandFromApi(true);  // Enable remote command mode
+    avoid_client.SwitchSet(false);  // 强制关闭内置避障，由程序自主控制
+
+    // 注册 SIGINT 信号处理器（仅设置标志，不阻塞）
+    signal(SIGINT, signalHandler);
+
+    /* Save initial pose */
+    px0 = px;
+    py0 = py;
+    yaw0 = yaw;
+
+    /* Front-RGB stream */
+    VideoCapture cap(
+        "udpsrc address=230.1.1.1 port=1720 multicast-iface=ens37 "
+        "! application/x-rtp, media=video, encoding-name=H264 "
+        "! rtph264depay ! avdec_h264 ! videoconvert "
+        "! video/x-raw,width=1280,height=720,format=BGR ! appsink drop=1",
+        CAP_GSTREAMER);
+    if (!cap.isOpened())
     {
         cerr << "Front camera stream not opened\n";
         return -1;
     }
 
+    Mat frame, undist;
+    int fcount = 0;
+    auto t0 = chrono::steady_clock::now();
+
+    // Start the aruco socket server in a background thread
     std::thread aruco_thread(aruco_socket_server, 5005);
     aruco_thread.detach();
 
-    return runMainLoop(rt);
+    /* Distance-based obstacle trigger (using position instead of lidar) */
+    double obstacle_trigger_px = 0.8;  // Advance 0.8 meters before entering obstacle avoidance
+    bool passed_obstacle_trigger = false;
+
+    /* ---------------------------  LOOP  --------------------------- */
+    while (!g_exit_requested)
+    {
+        if (!cap.read(frame) || frame.empty())
+            break;
+        fcount++;
+        undistort(frame, undist, K, D);
+
+        // Status output every 30 frames
+        if (fcount % 30 == 0)
+        {
+            double lx, ly, dyaw;
+            transformLocal(px, py, yaw, lx, ly, dyaw);
+            cout << "[Status] Flag=" << Flag_Task << " lx=" << lx << " ly=" << ly
+                 << " yaw=" << dyaw << " px=" << px << " py=" << py << endl;
+        }
+
+        /* FPS overlay */
+        double fps = fcount / chrono::duration<double>(chrono::steady_clock::now() - t0).count();
+        putText(undist, format("FPS %.1f", fps), {10, 30},
+                FONT_HERSHEY_SIMPLEX, 1, {0, 255, 0}, 2);
+
+        /*****************   MAIN FSM  *****************/
+        double lx, ly, dyaw;
+        transformLocal(px, py, yaw, lx, ly, dyaw);
+        double yaw_pid = dyaw * -5.0; // crude P controller (rad->cmd)
+
+        //Flag_Task = 3
+        switch (Flag_Task)
+        {
+        case 0: /* Line following - advance until obstacle detected visually */
+        {
+
+            // --- 跳跃前先向前直行 0.2m ---
+            // ★ 用 sc.Move 而非 avoid_client.Move，避免命令冲突导致后面转不了弯
+            static int init_stage = 0;  // 0=先直走, 1=再跳跃, 2=恢复站立, 3=开始巡线
+            if (init_stage == 0) {
+                sc.StaticWalk();
+                sc.Euler(0, 0, 0);   // 平视向前走
+                sc.Move(0.15, 0, 0);
+                if (lx >= 0.2) {
+                    sc.StopMove();
+                    sc.Move(0, 0, 0);  // 彻底清除 sc 的运动缓存
+                    init_stage = 1;
+                    cout << "[Start] ✅ Pre-move 0.2m done (lx=" << lx << ")" << endl;
+                }
+                break;  // 跳过巡线逻辑，下一帧继续前进
+            }
+            if (init_stage == 1) {
+                sc.FrontJump();
+                init_stage = 2;
+                this_thread::sleep_for(chrono::milliseconds(300));
+
+                // 跳跃后先保存起点，但还不开始巡线
+                px0 = px;
+                py0 = py;
+                yaw0 = yaw;
+                cout << "[Start] Jump done, reset origin. Now stabilizing..." << endl;
+                break;
+            }
+            if (init_stage == 2) {
+                // 跳跃后做 BalanceStand 恢复稳定，避免僵直倒地
+                sc.BalanceStand();
+                this_thread::sleep_for(chrono::milliseconds(500));
+                init_stage = 3;
+                cout << "[Start] ✅ Stabilized after jump. Starting line follow." << endl;
+                break;
+            }
+            // init_stage == 3: 正常巡线（继续执行下面的巡线代码）
+
+
+            // Line detection
+            double line_err = 0;
+            int line_cnt = 0;
+            Mat line_debug;
+            bool line_found = detectLine(undist, line_err, line_cnt, line_debug);
+
+            // —————— 线条连续性检查 ——————
+            // 如果线条中心相比上一帧跳变超过 130 像素，且 lx >= 0.6（已走够距离），
+            // 说明巡线到终点了（"入口"文字出现），立即结束巡线进入避障
+            static double prev_line_err = 0;
+            static bool had_line_before = false;
+            if (line_found && had_line_before && lx >= 0.6) {
+                double jump = abs(line_err - prev_line_err);
+                if (jump > 130.0) {
+                    cout << "[Line] ⚠️ JUMP detected: prev_err=" << prev_line_err
+                         << " now=" << line_err << " jump=" << jump
+                         << " → END OF LINE, entering obstacle avoidance" << endl;
+                    line_found = false;
+                    sc.StopMove();
+                    Flag_Task = 1;
+                    cout << "\033[32m[Transition] Line ended (JUMP), entering obstacle avoidance\033[0m" << endl;
+                }
+            }
+            if (line_found) {
+                prev_line_err = line_err;
+                had_line_before = true;
+            }
+
+            // 每帧输出 lx 值，方便调试
+            if (fcount % 10 == 0)
+            {
+                cout << "[Line] lx=" << lx << " ly=" << ly << " (trigger at " << obstacle_trigger_px << "m)" << endl;
+            }
+
+            // —————— [新增] ly 漂移主动回正 ——————
+            // 当 ly > 0.35 或 ly < -0.35 时，说明机器狗已经横向偏离了轨迹
+            // 叠加一个侧向纠偏转向，优先级高于巡线PID
+            double ly_correction = 0;
+            if (ly > 0.35) {
+                ly_correction = -0.3;  // 偏右太多 → 左转回正
+                cout << "[LY] ly=" << ly << " > 0.35 → LEFT correction" << endl;
+            } else if (ly < -0.35) {
+                ly_correction = 0.3;   // 偏左太多 → 右转回正
+                cout << "[LY] ly=" << ly << " < -0.35 → RIGHT correction" << endl;
+            }
+
+            if (line_found)
+            {
+                // Validate: check if error is within reasonable range
+                if (abs(line_err) < 400 && line_cnt > 100 && line_cnt < 10000)
+                {
+                    cout << "[Line] lx=" << lx << " ly=" << ly << " err=" << line_err 
+                         << " cnt=" << line_cnt << " (OK)" << endl;
+                    
+                    // PID 巡线控制
+                    static double integral = 0, last_err = 0;
+                    double Kp = 0.12;   // 大幅提高比例增益：err=-200 → steer≈+0.5（满幅左转）
+                    double Ki = 0.002;  // 提高积分增益，消除稳态误差
+                    double Kd = 0.01;   // 微分增益，抑制过冲
+                    
+                    integral += line_err;
+                    // 限制积分防止饱和
+                    integral = std::max(-50.0, std::min(50.0, integral));
+    
+                    double derivative = line_err - last_err;
+                    last_err = line_err;
+    
+                    // PID 输出
+                    // err 负值（线偏左）→ steer 负值 → 左转 → 纠偏回正
+                    // 乘以 -1: err=-228 (偏左) → -(-228 * 0.12) = +27 → 限幅 +0.5 → 左转
+                    double steer = -(Kp * line_err + Ki * integral + Kd * derivative);
+                    steer = std::max(-0.5, std::min(0.5, steer));
+                    
+                    // ly 纠偏覆盖：如果 ly 偏差过大，以 ly 纠偏为主
+                    if (abs(ly_correction) > 0.01) {
+                        steer = ly_correction;
+                        cout << "[Line] ly OVERRIDE steer=" << steer << endl;
+                    }
+    
+                    // 叠加航向保持：始终锁定向 yaw0 方向，dyaw 偏差越大纠偏越强
+                    steer += -dyaw * 1.5;
+                    steer = std::max(-0.5, std::min(0.5, steer));
+
+                    cout << "[Line] steer=" << steer << " (yaw_keep: dyaw=" << dyaw*180/M_PI << "deg)" << endl;
+    
+                    sc.StaticWalk();
+                    // 低头姿态：pitch = 0.4（加大前倾角度，让摄像头更容易看到地面线条）
+                    sc.Euler(0, 0.4, 0);
+                    sc.Move(0.25, 0, steer);
+    
+                    // Update display image - use local variable for debug
+                    cv::Mat display_img = line_debug.clone();
+                    putText(display_img, format("FPS %.1f", fps), {10, 30},
+                            FONT_HERSHEY_SIMPLEX, 1, {0, 255, 0}, 2);
+                    undist = display_img;
+                }
+                else
+                {
+                    // Error out of range → 直行基础上按偏差方向软纠偏
+                    double soft_steer = 0;
+                    if (abs(line_err) < 640) {  // 640 = 半幅画面宽，仍在有效范围内
+                        soft_steer = -line_err * 0.003;  // 软纠偏 Kp=0.003: err=-200 → steer=+0.6 → 左转
+                        soft_steer = std::max(-0.3, std::min(0.3, soft_steer));
+                    }
+                    // ly 纠偏覆盖
+                    if (abs(ly_correction) > 0.01) {
+                        soft_steer = ly_correction;
+                        cout << "[Line] INVALID ly OVERRIDE steer=" << soft_steer << endl;
+                    }
+                    // 航向保持：锁定向 yaw0 方向
+                    soft_steer += -dyaw * 1.5;
+                    soft_steer = std::max(-0.5, std::min(0.5, soft_steer));
+                    cout << "[Line] INVALID: err=" << line_err << " cnt=" << line_cnt 
+                         << " -> going straight with soft steer=" << soft_steer << " (yaw_keep: dyaw=" << dyaw*180/M_PI << "deg)" << endl;
+                    sc.StaticWalk();
+                    // 低头姿态：pitch = 0.4（加大前倾角度）
+                    sc.Euler(0, 0.4, 0);
+                    sc.Move(0.2, 0, soft_steer);  // 直行 + 软纠偏
+
+                    cv::Mat display_img = line_debug.clone();
+                    putText(display_img, format("FPS %.1f", fps), {10, 30},
+                            FONT_HERSHEY_SIMPLEX, 1, {0, 255, 0}, 2);
+                    undist = display_img;
+                }
+            }
+            else
+            {
+                cout << "[Line] NO LINE - going straight";
+                // ly 纠偏覆盖
+                if (abs(ly_correction) > 0.01) {
+                    cout << " with ly steer=" << ly_correction;
+                }
+                // 航向保持：锁定向 yaw0 方向
+                double noline_steer = ly_correction + (-dyaw * 1.5);
+                noline_steer = std::max(-0.3, std::min(0.3, noline_steer));
+                cout << " (yaw_keep: dyaw=" << dyaw*180/M_PI << "deg steer=" << noline_steer << ")" << endl;
+                sc.StaticWalk();
+                // 低头姿态：pitch = 0.4（加大前倾角度）
+                sc.Euler(0, 0.4, 0);
+                sc.Move(0.15, 0, noline_steer);
+            }
+            
+            // Update undist for display in NO LINE case
+            cv::Mat display_img = line_debug.clone();
+            putText(display_img, format("FPS %.1f", fps), {10, 30},
+                    FONT_HERSHEY_SIMPLEX, 1, {0, 255, 0}, 2);
+            undist = display_img;
+
+            // 使用雷达检测障碍物，而不是固定位置触发
+            // 当 lx > 0.75m 且雷达检测到前方障碍 < 1.5m 时进入避障
+            if (lx > 0.75 && g_lidar_front_dist < 1.5)
+            {
+                cout << "\033[32m[Transition] Obstacle detected by lidar (dist=" << g_lidar_front_dist << "m), entering obstacle avoidance\033[0m" << endl;
+                sc.StopMove();
+                Flag_Task = 1;
+            }
+        }
+        break;
+
+        case 1: /* Obstacle avoidance - S-shaped corridor navigation */
+        {
+            // ✅ 避障阶段平视（pitch=0），让激光雷达正对前方墙壁
+            sc.Euler(0, 0, 0);
+            sc.StaticWalk();
+
+            static int phase = 0;
+            static double phase_start_lx = lx;
+            static double yaw_turn_start = yaw;
+
+            // —————— 雷达三通道：front=x, left=y, right=z ——————
+            // 使用 EMA 滤波值做控制，平滑抗噪
+            double front_dist = g_lidar_front_f;
+            double left_dist  = g_lidar_left_f;
+            double right_dist = g_lidar_right_f;
+
+            // —————— 墙壁检测：用原始值（反应灵敏，不受 EMA 延迟影响） ——————
+            // 原始值在 0.01~0.6 之间 → 墙在附近，提前触发转弯（避免撞墙）
+            // 原始值 < 0.01 → 传感器已超出量程（贴脸了），也视为撞墙（需滤波确认）
+            bool front_wall_raw = (g_lidar_front_dist > 0.01 && g_lidar_front_dist <= 0.6);
+            bool front_too_close_raw = (g_lidar_front_dist <= 0.01 && front_dist < 0.6);  // 贴脸+滤波确认
+            bool wall_detected = front_wall_raw || front_too_close_raw;
+            // —————— 直行阶段触发条件 ——————
+            // 所有直行阶段直接用 wall_detected（前墙≤0.6m）
+            bool wall_detected_straight = wall_detected;
+
+            // —————— 三向安全保护（参考代码 applyRangeClearance） ——————
+            // 侧向 < 0.2m 或无效时推反方向 vy
+            // 前向 < 0.4m 或无效时减速后退
+            float vx_safe = 0.15f, vy_safe = 0.f;
+            
+            // 左侧太近 → vy 减小（向右侧平移）
+            if (left_dist > 999.0 || left_dist < 0.2) {
+                float deficit = (left_dist > 999.0) ? 0.2f : (0.2f - left_dist);
+                vy_safe -= std::min(0.38f, deficit * 3.0f);
+            }
+            // 右侧太近 → vy 增大（向左侧平移）
+            if (right_dist > 999.0 || right_dist < 0.2) {
+                float deficit = (right_dist > 999.0) ? 0.2f : (0.2f - right_dist);
+                vy_safe += std::min(0.38f, deficit * 3.0f);
+            }
+            // 前方太近 → 减速/后退
+            if (front_dist > 999.0 || front_dist < 0.4) {
+                float deficit = (front_dist > 999.0) ? 0.4f : (0.4f - front_dist);
+                vx_safe -= std::min(0.28f, deficit * 2.0f);
+                vx_safe = std::max(-0.28f, vx_safe);
+            }
+            
+            // 安全状态日志
+            bool safety_active = (abs(vy_safe) > 0.02 || vx_safe < 0.12);
+            if (safety_active) {
+                cout << "[OB] 🛡️ SAFETY: vx=" << vx_safe << " vy=" << vy_safe
+                     << " (front=" << front_dist << " left=" << left_dist << " right=" << right_dist << ")" << endl;
+            }
+
+            // —————— 走廊居中（参考代码：vy = (left-right) * gain） ——————
+            bool is_straight = (phase == 0 || phase == 2 || phase == 4 || phase == 6 || phase == 8 || phase == 10);
+            float vy_center = 0.f;
+            if (is_straight) {
+                float side_sum = left_dist + right_dist;
+                if (side_sum > 0.05f) {
+                    vy_center = std::max(-0.12f, std::min((float)((left_dist - right_dist) * 0.42f), 0.12f));
+                    if (abs(vy_center) > 0.01f)
+                        cout << "[OB] 🎯 Centering: L=" << left_dist << " R=" << right_dist << " vy=" << vy_center << endl;
+                }
+            }
+
+            // —————— 最终 vx/vy ——————
+            // 安全保护优先，centering 叠加（同号相加）
+            float vx_final = vx_safe;
+            float vy_final = vy_safe + vy_center;
+            vy_final = std::max(-0.38f, std::min(0.38f, vy_final));
+
+            // 🔍 打印调试信息（每10帧一次）
+            if (fcount % 10 == 0) 
+            {
+                cout << "[OB] S-CORRIDOR phase=" << phase
+                     << " F=" << front_dist << " L=" << left_dist << " R=" << right_dist
+                     << " lx=" << lx << " vy=" << vy_final
+                     << " yaw=" << yaw*180/M_PI << "deg" << endl;
+            }
+
+            // ----- Phase 0: 走到墙，同时保持直线 -----
+            if (phase == 0) {
+                // Phase 0 走直线纠偏：ly 漂移回正 + 航向保持
+                // ly 横向偏差 → 转向纠偏（ly>0 偏右 → 左转 steer 负值）
+                double steer_phase0 = -ly * 0.3;
+                // 航向保持：锁定跳跃完成时的 yaw0 方向
+                double yaw_drift = yaw - yaw0;
+                if (yaw_drift > M_PI) yaw_drift -= 2*M_PI;
+                if (yaw_drift < -M_PI) yaw_drift += 2*M_PI;
+                steer_phase0 += -yaw_drift * 2.0;
+                steer_phase0 = std::max(-0.3, std::min(0.3, steer_phase0));
+
+                // 仅在偏差明显时打印
+                if (abs(steer_phase0) > 0.02) {
+                    cout << "[OB] Phase0 STRAIGHT: ly=" << ly << " yaw_drift="
+                         << yaw_drift*180/M_PI << "deg steer=" << steer_phase0 << endl;
+                }
+
+                sc.Move(vx_final, vy_final, steer_phase0);
+
+                // 紧急停止保护
+                if (front_dist < 0.2) {
+                    sc.Move(0, 0, 0);
+                    cout << "[OB] ⚠️ EMERGENCY STOP: front_dist=" << front_dist << "m!" << endl;
+                }
+
+                // Phase 0: lx >= 1.4 后才允许触发（避免刚进入避障就立刻转）
+                if (wall_detected && lx >= 1.4) {
+                    // ❌ 不用 StopMove，避免踉跄撞墙，直接切 phase
+                    phase = 1;
+                    yaw_turn_start = yaw;
+                    phase_start_lx = lx;
+                    cout << "[OB] ✅ Phase 0 DONE: Wall at " << front_dist
+                         << "m (lx=" << lx << ") → START LEFT TURN 90°" << endl;
+                }
+            }
+            // ----- Phase 1/3/9: 向左弧线转 90° -----
+            else if (phase == 1 || phase == 3 || phase == 9) {
+                double yaw_diff = yaw - yaw_turn_start;
+                if (yaw_diff < -M_PI) yaw_diff += 2 * M_PI;
+                if (yaw_diff > M_PI) yaw_diff -= 2 * M_PI;
+
+                if (yaw_diff >= M_PI / 2 * 0.9) {
+                    phase++;
+                    phase_start_lx = lx;
+                    cout << "[OB] ✅ Phase " << phase-1 << " DONE: Left turn 90° (yaw diff=" << yaw_diff*180/M_PI << "deg)" << endl;
+                } else {
+                    // 转弯时最慢前进 vx=0.15，加快旋转速度 yaw_rate=0.8
+                    float vx_turn = std::min(0.15f, vx_final);
+                    sc.Move(vx_turn, vy_final, 0.8f);  // 左转弧线（旋转更快）
+                }
+            }
+            // ----- Phase 5/7: 向右弧线转 90° -----
+            else if (phase == 5 || phase == 7) {
+                double yaw_diff = yaw - yaw_turn_start;
+                if (yaw_diff < -M_PI) yaw_diff += 2 * M_PI;
+                if (yaw_diff > M_PI) yaw_diff -= 2 * M_PI;
+
+                if (yaw_diff <= -M_PI / 2 * 0.9) {
+                    phase++;
+                    phase_start_lx = lx;
+                    cout << "[OB] ✅ Phase " << phase-1 << " DONE: Right turn 90° (yaw diff=" << yaw_diff*180/M_PI << "deg)" << endl;
+                } else {
+                    // 右转同样最慢前进 vx=0.15，加快旋转速度 yaw_rate=-0.8
+                    float vx_turn = std::min(0.15f, vx_final);
+                    sc.Move(vx_turn, vy_final, -0.8f);  // 右转弧线（旋转更快）
+                }
+            }
+            // ----- Phase 2/4/6/8/10: 直行 -----
+            else if (phase == 2 || phase == 4 || phase == 6 || phase == 8 || phase == 10) {
+                // ❌ 不再加延迟，检测到墙立刻触发（避免撞墙）
+                if (wall_detected_straight) {
+                    if (phase == 10) {
+                        // Phase 10 → 完成 S 型序列
+                        phase = 0;
+                        Flag_Task = 0;
+                        cout << "[OB] 🎉 S-SHAPED CORRIDOR NAVIGATION COMPLETE! Resuming line follow." << endl;
+                    } else {
+                        phase++;
+                        yaw_turn_start = yaw;
+                        phase_start_lx = lx;
+                        cout << "[OB] ✅ Phase " << phase-1 << " DONE: Forward until wall → Phase " << phase << endl;
+                    }
+                } else {
+                    sc.Move(vx_final, vy_final, 0.f);
+                }
+            }
+        }
+        break;
+
+        case 2: /* Aruco detection - turn left 90 degrees */
+        {
+            static bool turned = false;
+            if (!turned)
+            {
+                sc.StopMove();
+                // Turn left until yaw changes by ~90 degrees
+                double yaw_at_turn_start = yaw;
+                while (true)
+                {
+                    double yaw_diff = yaw - yaw_at_turn_start;
+                    if (yaw_diff < -M_PI) yaw_diff += 2 * M_PI;
+                    if (yaw_diff > M_PI) yaw_diff -= 2 * M_PI;
+
+                    if (yaw_diff < -M_PI / 2 * 0.9)  // 90% of 90 degrees
+                        break;
+                    sc.Move(0, 0, 0.15);
+                }
+                sc.StopMove();
+                turned = true;
+                Flag_Task = 3;
+            }
+            else
+            {
+                // Check for aruco marker
+                if (g_last_aruco_id == 0)
+                {
+                    cout << "[Aruco] Marker 0 detected!" << endl;
+                    Flag_Task = 3;
+                }
+                else
+                {
+                    sc.Move(0.15, 0, 0);
+                }
+            }
+        }
+        break;
+
+        case 3: /* Move forward to next aruco */
+        {
+            sc.StaticWalk();
+            sc.Euler(0, 0, 0);
+            sc.Move(0.2, 0, 0);
+
+            if (g_last_aruco_id > 0)  // Next marker detected
+            {
+                cout << "[Aruco] Next marker detected: " << g_last_aruco_id.load() << endl;
+                Flag_Task = 4;
+            }
+        }
+        break;
+
+        case 4: /* Right turn and continue */
+        {
+            sc.StopMove();
+            double yaw_at_start = yaw;
+            while (true)
+            {
+                double yaw_diff = yaw - yaw_at_start;
+                if (yaw_diff < -M_PI) yaw_diff += 2 * M_PI;
+                if (yaw_diff > M_PI) yaw_diff -= 2 * M_PI;
+
+                if (yaw_diff > M_PI / 2 * 0.9)  // Right turn 90 degrees
+                    break;
+                sc.Move(0, 0, -0.15);
+            }
+            sc.StopMove();
+            Flag_Task = 5;
+        }
+        break;
+
+        case 5: /* Stairs area - use FreeWalk mode */
+        {
+            sc.FreeWalk();
+
+            // Simple stair traversal: move forward
+            sc.Move(0.15, 0, 0);
+
+            // After some distance, move to next phase
+            double lx_stairs, ly_stairs, dyaw_stairs;
+            transformLocal(px, py, yaw, lx_stairs, ly_stairs, dyaw_stairs);
+            if (lx_stairs > obstacle_trigger_px + 2.0)
+            {
+                Flag_Task = 6;
+            }
+        }
+        break;
+
+        case 6: /* Back to normal gait */
+        {
+            sc.StaticWalk();
+            sc.Move(0.2, 0, 0);
+
+            if (g_last_aruco_id > 0)
+            {
+                Flag_Task = 7;
+            }
+        }
+        break;
+
+        case 7: /* Turn left towards finish */
+        {
+            sc.StopMove();
+            double yaw_at_start = yaw;
+            while (true)
+            {
+                double yaw_diff = yaw - yaw_at_start;
+                if (yaw_diff < -M_PI) yaw_diff += 2 * M_PI;
+                if (yaw_diff > M_PI) yaw_diff -= 2 * M_PI;
+
+                if (yaw_diff < -M_PI / 2 * 0.9)
+                    break;
+                sc.Move(0, 0, 0.15);
+            }
+            sc.StopMove();
+            Flag_Task = 8;
+        }
+        break;
+
+        case 8: /* Jump into finish area */
+        {
+            if (end_jump_times == 0)
+            {
+                sc.FrontJump();
+                end_jump_times++;
+            }
+            sc.Move(0.2, 0, 0);
+            Flag_Task = 9;
+        }
+        break;
+
+        case 9: /* Finish */
+            sc.StopMove();
+            // Restore remote control fully
+            avoid_client.UseRemoteCommandFromApi(false);
+            avoid_client.SwitchSet(false);
+            avoid_client.Move(0, 0, 0);
+            this_thread::sleep_for(chrono::milliseconds(200));
+            sc.SwitchJoystick(true);  // Re-enable joystick control
+            sc.RecoveryStand();       // Recover to standing, release API control
+            this_thread::sleep_for(chrono::milliseconds(500));
+            sc.BalanceStand();
+            cout << "\033[32mMission complete! Remote control restored.\033[0m" << endl;
+            return 0;
+        }
+
+        imshow("Go2 Front Cam - Visual Nav", undist);
+        int key = waitKey(1);
+        if (key == 27 || g_exit_requested)
+            break; // ESC or Ctrl+C to quit
+    }
+    cout << "[Exit] Cleaning up and restoring remote control..." << endl;
+    sc.StopMove();
+    // Restore remote control before exit
+    avoid_client.UseRemoteCommandFromApi(false);
+    avoid_client.SwitchSet(false);
+    avoid_client.Move(0, 0, 0);
+    this_thread::sleep_for(chrono::milliseconds(200));
+    sc.SwitchJoystick(true);
+    sc.RecoveryStand();
+    this_thread::sleep_for(chrono::milliseconds(500));
+    sc.BalanceStand();
+    cout << "[Exit] Remote control restored. Goodbye." << endl;
+
+    return 0;
 }

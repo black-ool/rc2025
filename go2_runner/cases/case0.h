@@ -5,10 +5,16 @@
 #include <opencv2/opencv.hpp>
 
 // =============================================================================
-// case0：前进 0.1m → 起跳 → 站直后稳定等待 → 巡线 → 检测窄过道进入 case1
-// 返回 true 表示已触发切换到 case1
+// case0：前进 0.2m → 起跳 → 稳定 → 巡线 → 触发切换
+// 与 rc2025.cpp Flag_Task=0 完全一致
+// 返回值:
+//   0 → 继续巡线
+//   1 → 切换到 case1 (避障)
+//   2 → 切换到 case2 (ArUco, 仅第二段巡线)
 // =============================================================================
-bool case0_tick(unitree::robot::go2::SportClient &sc,
-                const cv::Mat &undist,
-                const unitree_go::msg::dds_::SportModeState_ &state,
-                double lx);
+int case0_tick(unitree::robot::go2::SportClient &sc,
+               const cv::Mat &undist,
+               const unitree_go::msg::dds_::SportModeState_ &state,
+               int fcount);
+
+void case0_reset_statics();

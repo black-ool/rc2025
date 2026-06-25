@@ -5,34 +5,31 @@
 // =============================================================================
 // 全局传感器与位姿状态
 // =============================================================================
-extern float ob_x, ob_y, ob_z;       // 雷达原始测距
+extern float ob_x, ob_y, ob_z;       // 雷达原始测距 (front=x, left=y, right=z)
 extern float ob_x_f, ob_y_f, ob_z_f; // 滤波后测距
 extern double px, py, yaw;           // 机体世界系位姿
-extern double px0, py0, yaw0;        // 程序启动时刻位姿
+extern double px0, py0, yaw0;        // 程序启动时刻位姿 (跳跃后重置)
 
 // =============================================================================
-// 任务状态机
+// 任务状态机 (与 rc2025.cpp 完全一致: 0-9)
 // =============================================================================
 extern int Flag_Task;                // 主状态机 case 编号
+extern int g_force_task;             // -1=自动, 0~9=强制锁定到指定 state
 
 extern int start_jump_times;
 extern int end_jump_times;
 extern bool found_turn;
 
 // =============================================================================
-// case1 迷宫子状态
+// 避障阶段状态 (case1 使用)
 // =============================================================================
-extern int g_maze_nav;
-extern double g_maze_turn_target;
-extern int g_maze_junc_stable;
-extern int g_maze_turn_cd;
-extern int g_maze_turn_frm;
-extern int g_case1_seg;
-extern bool g_case1_left90_done;
-extern int g_case1_post90_stable;
-extern int g_case1_entry_delay_frm;
-extern int g_case1_coord_w_sign;
-extern bool g_case2_post_maze_placeholder;
+extern int obstacle_avoidance_state;
+
+// =============================================================================
+// case0 巡线标记
+// =============================================================================
+extern bool g_case0_second_pass;     // case1 完成后设为 true（第二段巡线）
+extern bool g_case0_skip_init;       // --task 0 时跳过跳跃/启动
 
 // =============================================================================
 // ArUco

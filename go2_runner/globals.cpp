@@ -8,22 +8,17 @@ double px0 = 0, py0 = 0, yaw0 = 0;
 
 // 任务状态机
 int Flag_Task = 0;
+int g_force_task = -1;  // -1=自动模式
 int start_jump_times = 0;
 int end_jump_times = 0;
 bool found_turn = false;
 
-// case1 迷宫子状态
-int g_maze_nav = 0;
-double g_maze_turn_target = 0.;
-int g_maze_junc_stable = 0;
-int g_maze_turn_cd = 0;
-int g_maze_turn_frm = 0;
-int g_case1_seg = 0;
-bool g_case1_left90_done = false;
-int g_case1_post90_stable = 0;
-int g_case1_entry_delay_frm = 0;
-int g_case1_coord_w_sign = 0;
-bool g_case2_post_maze_placeholder = false;
+// 避障阶段
+int obstacle_avoidance_state = 0;
+
+// case0 巡线标记
+bool g_case0_second_pass = false;
+bool g_case0_skip_init = false;
 
 // ArUco
 std::atomic<int> g_last_aruco_id(-1);

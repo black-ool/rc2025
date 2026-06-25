@@ -1,277 +1,182 @@
 #include "case1.h"
 #include "../params.h"
 #include "../globals.h"
-#include "../utils.h"
 
 #include <cmath>
 #include <iostream>
+#include <algorithm>
 
 using namespace unitree::robot;
 using namespace std;
 
 // =============================================================================
-// 内部辅助（仅 case1 使用）
+// case1：S型走廊避障 (与 rc2025.cpp Flag_Task=1 完全一致)
 // =============================================================================
-
-/** 开始一次 180° 掉头 */
-static void case1BeginUTurn(go2::SportClient &sc, bool turn_left)
+bool case1_tick(go2::SportClient &sc,
+                int fcount,
+                double lx,
+                double ly,
+                double yaw_now)
 {
-    g_maze_turn_target = wrapAngle(yaw + (turn_left ? M_PI : -M_PI));
-    g_case1_coord_w_sign = turn_left ? 1 : -1;
-    g_maze_nav = 1;
-    g_maze_turn_frm = 0;
-    (void)sc;
-}
-
-/** 开始左转 90° 弧线 */
-static void case1BeginLeft90Arc(go2::SportClient &sc)
-{
-    g_maze_turn_target = wrapAngle(yaw + M_PI / 2.0);
-    g_case1_coord_w_sign = 1;
-    g_maze_nav = 2;
-    g_maze_turn_frm = 0;
-    (void)sc;
-}
-
-/** 第二次掉头前的路口触发判定 */
-static bool isCase1SecondJunctionTrigger(float front, float left, float right)
-{
-    return isMazeJunctionCandidate(front, left, right);
-}
-
-/** 巡航一帧 */
-static void case1CorridorFollowFrame(go2::SportClient &sc, float left, float right, float side_sum)
-{
-    sc.StaticWalk();
-    float vx = kMazeForwardVx;
-    float vy = 0.f;
-    if (side_sum > 0.05f)
-        vy = std::max(-kMazeCorridorVyClamp,
-                      std::min(kMazeCorridorVyClamp, (left - right) * kMazeCorridorVyGain));
-    applyRangeClearance(ob_x, ob_y, ob_z, vx, vy);
-    sc.Move(vx, vy, 0.f);
-}
-
-/**
- * 180° 协调掉头单帧
- * @return 0 进行中；1 到位；2 超时
- */
-static int case1UTurnTickFrame(go2::SportClient &sc)
-{
-    sc.StaticWalk();
-    const double err = wrapAngle(g_maze_turn_target - yaw);
-    ++g_maze_turn_frm;
-
-    if (std::fabs(err) <= kYawTurnDoneErrRad)
-    {
-        sc.StopMove();
-        g_maze_turn_frm = 0;
-        g_maze_turn_cd = kMazeTurnCooldownFrames;
-        g_maze_nav = 0;
-        g_maze_junc_stable = 0;
-        return 1;
-    }
-    if (g_maze_turn_frm > kMazeTurnTimeoutFrames)
-    {
-        sc.StopMove();
-        g_maze_nav = 0;
-        g_maze_turn_frm = 0;
-        g_maze_turn_cd = kMazeTurnCooldownFrames * 2;
-        return 2;
-    }
-
-    float vx = kCase1UTurnForwardVx;
-    if (g_case1_seg == 0)
-        vx *= kCase1FirstUTurnVxScale;
-    else if (g_case1_seg == 1)
-        vx *= kCase1SecondUTurnVxScale;
-    applyRangeClearanceFrontOnly(ob_x, vx);
-    const double vx_use = std::max((double)vx, 1e-4);
-    double R_eff = kCase1UTurnRadius_m;
-    if (g_case1_seg == 0)
-        R_eff *= kCase1FirstUTurnRadiusScale;
-    else if (g_case1_seg == 1)
-        R_eff *= kCase1SecondUTurnRadiusScale;
-    double w_mag = vx_use / R_eff;
-    if (w_mag < kYawTurnCmdFloor)
-        w_mag = kYawTurnCmdFloor;
-    w_mag = std::min(w_mag, kYawTurnCmdClamp);
-    const int w_dir = (g_case1_coord_w_sign >= 0 ? 1 : -1);
-    float vy = 0.f;
-    if (g_case1_seg == 0 && g_case1_coord_w_sign > 0)
-        vy = kCase1FirstUTurnVyBias;
-    else if (g_case1_seg == 1 && g_case1_coord_w_sign < 0)
-        vy = kCase1SecondUTurnVyBias;
-    const double w_cmd = (double)w_dir * w_mag;
-    sc.Move(vx, vy, w_cmd);
-    return 0;
-}
-
-/**
- * 左转 90° 协调弧线单帧
- * @return 0 进行中；1 到位；2 超时
- */
-static int case1Arc90LeftTickFrame(go2::SportClient &sc)
-{
-    sc.StaticWalk();
-    const double err = wrapAngle(g_maze_turn_target - yaw);
-    ++g_maze_turn_frm;
-
-    if (std::fabs(err) <= kYawTurnDoneErrRad)
-    {
-        sc.StopMove();
-        g_maze_turn_frm = 0;
-        g_maze_turn_cd = kMazeTurnCooldownFrames;
-        g_maze_nav = 0;
-        g_maze_junc_stable = 0;
-        g_case1_post90_stable = 0;
-        g_case1_left90_done = true;
-        return 1;
-    }
-    if (g_maze_turn_frm > kMazeArc90TimeoutFrames)
-    {
-        sc.StopMove();
-        g_maze_nav = 0;
-        g_maze_turn_frm = 0;
-        g_maze_turn_cd = kMazeTurnCooldownFrames * 2;
-        g_case1_left90_done = true;
-        return 2;
-    }
-
-    float vx = kCase1UTurnForwardVx;
-    applyRangeClearanceFrontOnly(ob_x, vx);
-    const double vx_use = std::max((double)vx, 1e-4);
-    double w_mag = vx_use / kCase1UTurnRadius_m;
-    if (w_mag < kYawTurnCmdFloor)
-        w_mag = kYawTurnCmdFloor;
-    w_mag = std::min(w_mag, kYawTurnCmdClamp);
-    const int w_dir = (g_case1_coord_w_sign >= 0 ? 1 : -1);
-    const double w_cmd = (double)w_dir * w_mag;
-    sc.Move(vx, 0.f, w_cmd);
-    return 0;
-}
-
-// =============================================================================
-// case1 主入口
-// =============================================================================
-bool case1_tick(go2::SportClient &sc)
-{
-    const float front = safeRange(ob_x_f);
-    const float left = safeRange(ob_y_f);
-    const float right = safeRange(ob_z_f);
-    const float side_sum = left + right;
-
+    // 平视，让激光雷达正对前方墙壁
     sc.Euler(0, 0, 0);
+    sc.StaticWalk();
 
-    if (g_maze_nav == 0)
+    static int phase = 0;
+    static double phase_start_lx = lx;
+    static double yaw_turn_start = yaw_now;
+
+    // 雷达三通道 (EMA 滤波值)
+    double front_dist = ob_x_f;
+    double left_dist  = ob_y_f;
+    double right_dist = ob_z_f;
+
+    // 墙壁检测：原始值 < 0.6m → 触发转弯
+    bool front_wall_raw = (ob_x > 0.01 && ob_x <= 0.6);
+    bool front_too_close_raw = (ob_x <= 0.01 && front_dist < 0.6);
+    bool wall_detected = front_wall_raw || front_too_close_raw;
+    bool wall_detected_straight = wall_detected;
+
+    // 三向安全保护
+    float vx_safe = 0.15f, vy_safe = 0.f;
+
+    // 左侧太近 → vy 减小（向右侧平移）
+    if (left_dist > 999.0 || left_dist < 0.2) {
+        float deficit = (left_dist > 999.0) ? 0.2f : (0.2f - left_dist);
+        vy_safe -= min(0.38f, deficit * 3.0f);
+    }
+    // 右侧太近 → vy 增大（向左侧平移）
+    if (right_dist > 999.0 || right_dist < 0.2) {
+        float deficit = (right_dist > 999.0) ? 0.2f : (0.2f - right_dist);
+        vy_safe += min(0.38f, deficit * 3.0f);
+    }
+    // 前方太近 → 减速/后退
+    if (front_dist > 999.0 || front_dist < 0.4) {
+        float deficit = (front_dist > 999.0) ? 0.4f : (0.4f - front_dist);
+        vx_safe -= min(0.28f, deficit * 2.0f);
+        vx_safe = max(-0.28f, vx_safe);
+    }
+
+    // 安全状态日志
+    bool safety_active = (abs(vy_safe) > 0.02 || vx_safe < 0.12);
+    if (safety_active) {
+        cout << "[OB] 🛡️ SAFETY: vx=" << vx_safe << " vy=" << vy_safe
+             << " (front=" << front_dist << " left=" << left_dist << " right=" << right_dist << ")" << endl;
+    }
+
+    // 走廊居中 (直行阶段)
+    bool is_straight = (phase == 0 || phase == 2 || phase == 4 || phase == 6 || phase == 8 || phase == 10);
+    float vy_center = 0.f;
+    if (is_straight) {
+        float side_sum = left_dist + right_dist;
+        if (side_sum > 0.05f) {
+            vy_center = max(-0.12f, min((float)((left_dist - right_dist) * 0.42f), 0.12f));
+            if (abs(vy_center) > 0.01f)
+                cout << "[OB] 🎯 Centering: L=" << left_dist << " R=" << right_dist << " vy=" << vy_center << endl;
+        }
+    }
+
+    // 最终 vx/vy
+    float vx_final = vx_safe;
+    float vy_final = vy_safe + vy_center;
+    vy_final = max(-0.38f, min(0.38f, vy_final));
+
+    // 调试输出
+    if (fcount % 10 == 0)
     {
-        if (g_maze_turn_cd > 0)
-            --g_maze_turn_cd;
+        cout << "[OB] S-CORRIDOR phase=" << phase
+             << " F=" << front_dist << " L=" << left_dist << " R=" << right_dist
+             << " lx=" << lx << " vy=" << vy_final
+             << " yaw=" << yaw_now*180/M_PI << "deg" << endl;
+    }
 
-        if (g_case1_entry_delay_frm > 0)
-        {
-            --g_case1_entry_delay_frm;
-            g_maze_junc_stable = 0;
+    // ----- Phase 0: 直线走到墙 (带纠偏) -----
+    if (phase == 0) {
+        double steer_phase0 = -ly * 0.3;
+        double yaw_drift = yaw_now - yaw0;
+        if (yaw_drift > M_PI) yaw_drift -= 2*M_PI;
+        if (yaw_drift < -M_PI) yaw_drift += 2*M_PI;
+        steer_phase0 += -yaw_drift * 2.0;
+        steer_phase0 = max(-0.3, min(0.3, steer_phase0));
+
+        if (abs(steer_phase0) > 0.02) {
+            cout << "[OB] Phase0 STRAIGHT: ly=" << ly << " yaw_drift="
+                 << yaw_drift*180/M_PI << "deg steer=" << steer_phase0 << endl;
         }
 
-        const bool cd_ok = (g_maze_turn_cd == 0);
-        bool started_maneuver = false;
+        sc.Move(vx_final, vy_final, steer_phase0);
 
-        const bool first_uturn_armed =
-            (g_case1_seg > 0) || (g_case1_entry_delay_frm == 0);
-        const bool detect_junction =
-            (g_case1_seg < kCase1NumUTurns) && cd_ok && first_uturn_armed;
+        // 紧急停止保护
+        if (front_dist < 0.2) {
+            sc.Move(0, 0, 0);
+            cout << "[OB] ⚠️ EMERGENCY STOP: front_dist=" << front_dist << "m!" << endl;
+        }
 
-        const bool cand_first =
-            detect_junction && (g_case1_seg == 0) && isMazeJunctionCandidate(front, left, right);
-        const bool cand_second =
-            detect_junction && (g_case1_seg == 1) && isCase1SecondJunctionTrigger(front, left, right);
+        // lx >= 1.4 后才允许触发
+        if (wall_detected && lx >= 1.4) {
+            phase = 1;
+            yaw_turn_start = yaw_now;
+            phase_start_lx = lx;
+            cout << "[OB] ✅ Phase 0 DONE: Wall at " << front_dist
+                 << "m (lx=" << lx << ") → START LEFT TURN 90°" << endl;
+        }
+    }
+    // ----- Phase 1/3/9: 向左弧线转 90° -----
+    else if (phase == 1 || phase == 3 || phase == 9) {
+        double yaw_diff = yaw_now - yaw_turn_start;
+        if (yaw_diff < -M_PI) yaw_diff += 2 * M_PI;
+        if (yaw_diff > M_PI) yaw_diff -= 2 * M_PI;
 
-        if (cand_first || cand_second)
-            ++g_maze_junc_stable;
-        else
-            g_maze_junc_stable = 0;
+        if (yaw_diff >= M_PI / 2 * 0.9) {
+            int prev = phase;
+            phase++;
+            phase_start_lx = lx;
+            cout << "[OB] ✅ Phase " << prev << " DONE: Left turn 90° (yaw diff=" << yaw_diff*180/M_PI << "deg)" << endl;
+        } else {
+            float vx_turn = min(0.15f, vx_final);
+            sc.Move(vx_turn, vy_final, 0.8f);  // 左转弧线
+        }
+    }
+    // ----- Phase 5/7: 向右弧线转 90° -----
+    else if (phase == 5 || phase == 7) {
+        double yaw_diff = yaw_now - yaw_turn_start;
+        if (yaw_diff < -M_PI) yaw_diff += 2 * M_PI;
+        if (yaw_diff > M_PI) yaw_diff -= 2 * M_PI;
 
-        if (detect_junction && g_maze_junc_stable >= kMazeJunctionStableFrames)
-        {
-            sc.StopMove();
-            g_maze_junc_stable = 0;
-            switch (g_case1_seg)
-            {
-            case 0:
-                case1BeginUTurn(sc, true);
-                started_maneuver = true;
-                cout << "[case1] 第1次路口触发 (front=" << front << " L=" << left << " R=" << right
-                     << ") → 180° R=" << kCase1UTurnRadius_m << "m 左转 目标yaw=" << g_maze_turn_target
-                     << endl;
-                break;
-            case 1:
-                case1BeginUTurn(sc, false);
-                started_maneuver = true;
-                cout << "[case1] 第2次路口触发（前进判定与第一次相同）(front=" << front << " L=" << left
-                     << " R=" << right << ") → 180° R=" << kCase1UTurnRadius_m << "m 右转 目标yaw="
-                     << g_maze_turn_target << endl;
-                break;
-            default:
-                break;
+        if (yaw_diff <= -M_PI / 2 * 0.9) {
+            int prev = phase;
+            phase++;
+            phase_start_lx = lx;
+            cout << "[OB] ✅ Phase " << prev << " DONE: Right turn 90° (yaw diff=" << yaw_diff*180/M_PI << "deg)" << endl;
+        } else {
+            float vx_turn = min(0.15f, vx_final);
+            sc.Move(vx_turn, vy_final, -0.8f);  // 右转弧线
+        }
+    }
+    // ----- Phase 2/4/6/8/10: 直行 -----
+    else if (phase == 2 || phase == 4 || phase == 6 || phase == 8 || phase == 10) {
+        if (wall_detected_straight) {
+            if (phase == 10) {
+                // Phase 10 → 完成 S 型序列，回到巡线
+                phase = 0;
+                cout << "[OB] 🎉 S-SHAPED CORRIDOR NAVIGATION COMPLETE! Resuming line follow." << endl;
+                return true;  // → Flag_Task = 0
+            } else {
+                phase++;
+                yaw_turn_start = yaw_now;
+                phase_start_lx = lx;
+                cout << "[OB] ✅ Phase " << phase-1 << " DONE: Forward until wall → Phase " << phase << endl;
             }
+        } else {
+            sc.Move(vx_final, vy_final, 0.f);
         }
-
-        /* 两次 180° 后：前方第 3 次满足路口判定（稳定帧）→ 左转 90° 弧线 */
-        if (!started_maneuver && (g_case1_seg == kCase1NumUTurns) && !g_case1_left90_done && cd_ok)
-        {
-            if (isMazeJunctionCandidate(front, left, right))
-                ++g_case1_post90_stable;
-            else
-                g_case1_post90_stable = 0;
-
-            if (g_case1_post90_stable >= kMazeJunctionStableFrames)
-            {
-                sc.StopMove();
-                g_case1_post90_stable = 0;
-                case1BeginLeft90Arc(sc);
-                started_maneuver = true;
-                cout << "[case1] 第3次路口判定 (front=" << front << " L=" << left << " R=" << right
-                     << ") → 左转90°弧线 R=" << kCase1UTurnRadius_m << "m 目标yaw=" << g_maze_turn_target
-                     << endl;
-            }
-        }
-
-        if (!started_maneuver)
-            case1CorridorFollowFrame(sc, left, right, side_sum);
     }
-    else if (g_maze_nav == 1)
-    {
-        const int ut = case1UTurnTickFrame(sc);
-        if (ut == 1)
-        {
-            ++g_case1_seg;
-            const double err = wrapAngle(g_maze_turn_target - yaw);
-            cout << "[case1] 第" << g_case1_seg << "次180°掉头完成 err=" << err;
-            if (g_case1_seg >= kCase1NumUTurns)
-                cout << " → 巡航，等待第3次路口判定做90°左弧" << endl;
-            else
-                cout << " → 继续前进，等待下一次路口" << endl;
-            case1CorridorFollowFrame(sc, left, right, side_sum);
-        }
-        else if (ut == 2)
-            cout << "[case1] 第" << (g_case1_seg + 1) << "次掉头超时" << endl;
-    }
-    else if (g_maze_nav == 2)
-    {
-        const int ar = case1Arc90LeftTickFrame(sc);
-        if (ar == 1)
-        {
-            const double err = wrapAngle(g_maze_turn_target - yaw);
-            cout << "[case1] 左转90°弧线完成 err=" << err << " → Flag_Task=2（占位停车）" << endl;
-            g_case2_post_maze_placeholder = true;
-            sc.StaticWalk();
-            sc.Euler(0, 0.25, 0);
-            sc.Move(0.f, 0.f, 0.f);
-            return true;
-        }
-        else if (ar == 2)
-            cout << "[case1] 左转90°弧线超时" << endl;
-    }
+
     return false;
+}
+
+void case1_reset_statics()
+{
+    // phase / phase_start_lx / yaw_turn_start 等 static 变量在 case1_tick 内部
+    // 此函数为占位，留待后续需要时扩展
 }
